@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import os
 from itertools import cycle
 
 import torch
@@ -69,11 +70,33 @@ def maybe_init_swanlab(cfg: dict):
     except ImportError:
         print("swanlab is not installed, training will continue without it.")
         return None
-    return swanlab.init(
-        project=cfg.get("project", "palette_decoupling"),
-        experiment_name=cfg.get("experiment_name"),
-        config=cfg,
+    run_id = os.environ.get("SWANLAB_RUN_ID", cfg.get("run_id"))
+    resume = os.environ.get("SWANLAB_RESUME", cfg.get("resume"))
+    mode = os.environ.get("SWANLAB_MODE", cfg.get("mode"))
+    logdir = os.environ.get("SWANLAB_LOGDIR", cfg.get("logdir"))
+    settings = {
+        "project": cfg.get("project", "palette_decoupling"),
+        "experiment_name": cfg.get("experiment_name"),
+        "config": cfg,
+    }
+    if run_id:
+        settings["id"] = run_id
+    if resume is not None:
+        settings["resume"] = resume
+    if mode:
+        settings["mode"] = mode
+    if logdir:
+        settings["logdir"] = logdir
+    print(
+        {
+            "swanlab_project": settings.get("project"),
+            "swanlab_run_id": settings.get("id"),
+            "swanlab_resume": settings.get("resume"),
+            "swanlab_mode": settings.get("mode"),
+            "swanlab_logdir": settings.get("logdir"),
+        }
     )
+    return swanlab.init(**settings)
 
 
 class EMA:
@@ -141,8 +164,11 @@ def validate(model, loader, device, sample_cfg: dict, max_batches: int | None = 
     if compute_fid and fid_preds:
         pred_tensor = torch.cat(fid_preds, dim=0)
         target_tensor = torch.cat(fid_targets, dim=0)
-        fid_per_channel = compute_channelwise_fid(pred_tensor, target_tensor)
-        metrics["fid_mean"] = float(sum(fid_per_channel) / len(fid_per_channel))
+        try:
+            fid_per_channel = compute_channelwise_fid(pred_tensor, target_tensor)
+            metrics["fid_mean"] = float(sum(fid_per_channel) / len(fid_per_channel))
+        except Exception as exc:
+            print(f"Skipping FID due to error: {exc}")
     return metrics
 
 
@@ -160,9 +186,21 @@ def save_checkpoint(path, model, optimizer, ema: EMA, step: int, cfg: dict, best
     )
 
 
+def load_checkpoint(path, model, optimizer, ema: EMA, device: torch.device) -> tuple[int, float]:
+    state = torch.load(path, map_location=device)
+    model.load_state_dict(state["model"])
+    if "ema_model" in state:
+        ema.ema_model.load_state_dict(state["ema_model"])
+    optimizer.load_state_dict(state["optimizer"])
+    start_step = int(state.get("step", 0))
+    best_metric = float(state.get("best_metric", float("inf")))
+    return start_step, best_metric
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Research-style step-based trainer for palette_decoupling.")
     parser.add_argument("--config", required=True, help="Path to yaml/json config.")
+    parser.add_argument("--resume", default=None, help="Optional checkpoint path to resume from.")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -223,10 +261,18 @@ def main() -> None:
     save_every = int(cfg["train"].get("save_every_steps", validate_every))
     log_every = int(cfg["train"].get("log_every_steps", 50))
     ema_start = int(cfg["train"].get("ema_start_step", 0))
+    fid_every = int(cfg["validation"].get("fid_every_steps", validate_every))
     best_metric = float("inf")
     best_metric_name = cfg["train"].get("best_metric", "val_mae")
+    start_step = 0
+
+    resume_path = args.resume or cfg["train"].get("resume_checkpoint")
+    if resume_path:
+        start_step, best_metric = load_checkpoint(resume_path, model, optimizer, ema, device)
+        print({"resumed_from": resume_path, "start_step": start_step, "best_metric": best_metric})
+
     train_iter = cycle(train_loader)
-    progress = tqdm(range(1, max_steps + 1), desc="train steps", leave=True)
+    progress = tqdm(range(start_step + 1, max_steps + 1), desc="train steps", leave=True, initial=start_step, total=max_steps)
     recent_losses: list[float] = []
 
     for step in progress:
@@ -258,7 +304,7 @@ def main() -> None:
                 device,
                 sample_cfg=cfg["validation"]["sampler"],
                 max_batches=cfg["validation"].get("max_batches"),
-                compute_fid=(step % int(cfg["validation"].get("fid_every_steps", validate_every)) == 0),
+                compute_fid=(fid_every > 0 and step % fid_every == 0),
             )
             val_metrics["step"] = step
             print(val_metrics)

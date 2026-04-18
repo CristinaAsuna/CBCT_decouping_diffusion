@@ -34,9 +34,9 @@ dataset:
 model:
   image_size: 256
   inner_channel: 64
-  channel_mults: [1, 2, 4, 8]
-  attn_res: [16]
-  res_blocks: 2
+  channel_mults: [1, 2, 4]
+  attn_res: []
+  res_blocks: 1
   dropout: 0.2
 
 diffusion:
@@ -48,11 +48,12 @@ diffusion:
 
 train:
   max_steps: 30000
-  batch_size: 16
-  val_batch_size: 16
+  batch_size: 4
+  val_batch_size: 4
   num_workers: 0
   lr: 0.00005
   weight_decay: 0.0
+  resume_checkpoint: null
   ema_decay: 0.9999
   ema_start_step: 100
   validate_every_steps: 1000
@@ -61,8 +62,8 @@ train:
   best_metric: "val_mae"
 
 validation:
-  max_batches: 32
-  fid_every_steps: 5000
+  max_batches: 10
+  fid_every_steps: 0
   sampler:
     sampler: "ddim"
     steps: 50
@@ -72,6 +73,10 @@ logging:
   use_swanlab: true
   project: "palette_decoupling_cbct"
   experiment_name: "cbct_1175_full_to_left_step_baseline"
+  mode: null
+  logdir: null
+  run_id: null
+  resume: null
 
 output:
   root: "D:/vscode_workplace/codeplace/palette/outputs/cbct_1175_full_to_left_step_baseline"
