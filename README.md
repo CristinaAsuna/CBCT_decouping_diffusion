@@ -267,6 +267,22 @@ python train_research.py
 ImportError: attempted relative import with no known parent package
 ```
 
+
+加入真实侧位片inference
+```bash
+cd D:\vscode_workplace\codeplace\palette
+python -m palette_decoupling.infer_real_sideemb `
+  --config palette_decoupling/configs/cbct_1175_full_to_lr_sideemb.yaml `
+  --checkpoint D:\vscode_workplace\codeplace\palette\outputs\cbct_1175_full_to_lr_sideemb\checkpoints\best_ema.pt `
+  --input D:\your_real_ceph_images `
+  --output-dir D:\your_real_ceph_outputs `
+  --face-direction right `
+  --posterior-trim-ratio 0.18 `
+  --save-debug
+
+```
+
+
 ## 当前最适合继续扩展的方向
 
 1. `full -> right` 镜像 baseline
