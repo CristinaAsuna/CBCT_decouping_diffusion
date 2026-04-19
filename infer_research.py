@@ -18,6 +18,8 @@ def build_dataset(dataset_cfg: dict):
         "normalize": dataset_cfg.get("normalize", "range_m11"),
         "value_range": dataset_cfg.get("value_range"),
         "clip_range": dataset_cfg.get("clip_range"),
+        "target_mode": dataset_cfg.get("target_mode", "multi_channel"),
+        "side_labels": dataset_cfg.get("side_labels"),
     }
     if dataset_type == "paired_dirs":
         return NpyConditionTargetDataset(
@@ -56,6 +58,7 @@ def build_model(cfg: dict, dataset, device: torch.device) -> GaussianConditional
         res_blocks=cfg["model"]["res_blocks"],
         dropout=cfg["model"].get("dropout", 0.0),
         beta_schedule=cfg["diffusion"]["beta_schedule"],
+        num_side_classes=getattr(dataset, "num_side_classes", 0),
     ).to(device)
 
 
@@ -85,7 +88,9 @@ def main() -> None:
     with torch.no_grad():
         for sample in dataset:
             condition = sample["condition"].unsqueeze(0).to(device)
-            pred = run_sampler(model, condition, sampler_cfg)[0]
+            side_ids = sample.get("side_id")
+            side_ids = side_ids.unsqueeze(0).to(device) if isinstance(side_ids, torch.Tensor) else None
+            pred = run_sampler(model, condition, sampler_cfg, side_ids=side_ids)[0]
             name = str(sample["name"])
             save_tensor_npy(pred, output_dir / f"{name}.npy")
             for channel_idx in range(pred.shape[0]):

@@ -23,6 +23,8 @@ def build_dataset(dataset_cfg: dict):
         "normalize": dataset_cfg.get("normalize", "range_m11"),
         "value_range": dataset_cfg.get("value_range"),
         "clip_range": dataset_cfg.get("clip_range"),
+        "target_mode": dataset_cfg.get("target_mode", "multi_channel"),
+        "side_labels": dataset_cfg.get("side_labels"),
     }
     if dataset_type == "paired_dirs":
         return NpyConditionTargetDataset(
@@ -117,13 +119,13 @@ class EMA:
                 value.mul_(self.decay).add_(model_state[key], alpha=1.0 - self.decay)
 
 
-def run_sampler(model: GaussianConditionalDiffusion, condition: torch.Tensor, sample_cfg: dict) -> torch.Tensor:
+def run_sampler(model: GaussianConditionalDiffusion, condition: torch.Tensor, sample_cfg: dict, side_ids: torch.Tensor | None = None) -> torch.Tensor:
     sampler = sample_cfg.get("sampler", "ddim")
     steps = sample_cfg.get("steps", 50)
     if sampler == "ddim":
-        return model.sample_ddim(condition, sample_steps=steps, eta=sample_cfg.get("eta", 0.0))
+        return model.sample_ddim(condition, sample_steps=steps, eta=sample_cfg.get("eta", 0.0), side_ids=side_ids)
     if sampler == "ddpm":
-        return model.sample(condition, sample_steps=steps)
+        return model.sample(condition, sample_steps=steps, side_ids=side_ids)
     raise ValueError(f"Unsupported sampler: {sampler}")
 
 
@@ -143,8 +145,10 @@ def validate(model, loader, device, sample_cfg: dict, max_batches: int | None = 
             break
         condition = batch["condition"].to(device)
         target = batch["target"].to(device)
-        loss = model(target, condition)
-        pred = run_sampler(model, condition, sample_cfg)
+        side_ids = batch.get("side_id")
+        side_ids = side_ids.to(device) if side_ids is not None else None
+        loss = model(target, condition, side_ids=side_ids)
+        pred = run_sampler(model, condition, sample_cfg, side_ids=side_ids)
         losses.append(float(loss.item()))
         maes.append(mae(pred, target))
         mses.append(mse(pred, target))
@@ -231,6 +235,7 @@ def main() -> None:
             "val_samples": len(val_dataset),
             "condition_channels": train_dataset.condition_channels,
             "target_channels": train_dataset.target_channels,
+            "num_side_classes": getattr(train_dataset, "num_side_classes", 0),
         }
     )
 
@@ -245,6 +250,7 @@ def main() -> None:
         res_blocks=cfg["model"]["res_blocks"],
         dropout=cfg["model"].get("dropout", 0.0),
         beta_schedule=cfg["diffusion"]["beta_schedule"],
+        num_side_classes=getattr(train_dataset, "num_side_classes", 0),
     ).to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -280,8 +286,10 @@ def main() -> None:
         model.train()
         condition = batch["condition"].to(device)
         target = batch["target"].to(device)
+        side_ids = batch.get("side_id")
+        side_ids = side_ids.to(device) if side_ids is not None else None
         optimizer.zero_grad(set_to_none=True)
-        loss = model(target, condition)
+        loss = model(target, condition, side_ids=side_ids)
         loss.backward()
         optimizer.step()
         if step >= ema_start:
@@ -318,7 +326,9 @@ def main() -> None:
 
             preview_batch = next(iter(val_loader))
             preview_condition = preview_batch["condition"].to(device)
-            preview_pred = run_sampler(eval_model, preview_condition, cfg["validation"]["sampler"])
+            preview_side_ids = preview_batch.get("side_id")
+            preview_side_ids = preview_side_ids.to(device) if preview_side_ids is not None else None
+            preview_pred = run_sampler(eval_model, preview_condition, cfg["validation"]["sampler"], side_ids=preview_side_ids)
             preview_name = str(preview_batch["name"][0])
             save_tensor_npy(preview_pred[0], sample_dir / f"step_{step:06d}_{preview_name}_pred.npy")
             for channel_idx in range(preview_pred.shape[1]):

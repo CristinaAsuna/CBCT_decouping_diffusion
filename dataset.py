@@ -81,6 +81,16 @@ class SampleSpec:
     name: str
     condition_path: Path
     target_paths: list[Path]
+    side_id: int | None = None
+
+
+def _infer_side_label(path: Path) -> str:
+    stem = path.stem.lower()
+    if stem.endswith("_left"):
+        return "left"
+    if stem.endswith("_right"):
+        return "right"
+    return stem.split("_")[-1]
 
 
 class NpyConditionTargetDataset(Dataset):
@@ -93,6 +103,8 @@ class NpyConditionTargetDataset(Dataset):
         names_file: str | None = None,
         value_range: list[float] | None = None,
         clip_range: list[float] | None = None,
+        target_mode: str = "multi_channel",
+        side_labels: Iterable[str] | None = None,
     ) -> None:
         self.condition_dir = Path(condition_dir)
         self.target_dirs = [Path(item) for item in target_dirs]
@@ -100,6 +112,8 @@ class NpyConditionTargetDataset(Dataset):
         self.normalize = normalize
         self.value_range = value_range
         self.clip_range = clip_range
+        self.target_mode = target_mode
+        self.side_labels = list(side_labels) if side_labels is not None else None
         self.samples = self._build_samples(names_file)
         if not self.samples:
             raise ValueError("No paired .npy samples were found.")
@@ -128,7 +142,15 @@ class NpyConditionTargetDataset(Dataset):
                     break
                 target_paths.append(target_path)
             if target_paths:
-                samples.append(SampleSpec(name=name, condition_path=condition_map[name], target_paths=target_paths))
+                if self.target_mode == "side_emb":
+                    labels = self.side_labels or [_infer_side_label(path) for path in target_paths]
+                    label_to_idx = {label: idx for idx, label in enumerate(labels)}
+                    for target_path in target_paths:
+                        label = _infer_side_label(target_path)
+                        side_id = label_to_idx[label]
+                        samples.append(SampleSpec(name=f"{name}__{label}", condition_path=condition_map[name], target_paths=[target_path], side_id=side_id))
+                else:
+                    samples.append(SampleSpec(name=name, condition_path=condition_map[name], target_paths=target_paths))
         return samples
 
     def _load_single(self, path: Path) -> torch.Tensor:
@@ -141,7 +163,10 @@ class NpyConditionTargetDataset(Dataset):
         sample = self.samples[index]
         condition = self._load_single(sample.condition_path)
         target = torch.cat([self._load_single(path) for path in sample.target_paths], dim=0)
-        return {"name": sample.name, "condition": condition, "target": target}
+        ret: dict[str, torch.Tensor | str] = {"name": sample.name, "condition": condition, "target": target}
+        if sample.side_id is not None:
+            ret["side_id"] = torch.tensor(sample.side_id, dtype=torch.long)
+        return ret
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -157,6 +182,13 @@ class NpyConditionTargetDataset(Dataset):
         first = self[0]["target"]
         assert isinstance(first, torch.Tensor)
         return int(first.shape[0])
+
+    @property
+    def num_side_classes(self) -> int:
+        if self.target_mode != "side_emb":
+            return 0
+        labels = self.side_labels or []
+        return len(labels) if labels else 2
 
 
 class CaseFolderNpyDataset(Dataset):
@@ -177,6 +209,8 @@ class CaseFolderNpyDataset(Dataset):
         train_ratio: float = 0.9,
         value_range: list[float] | None = None,
         clip_range: list[float] | None = None,
+        target_mode: str = "multi_channel",
+        side_labels: Iterable[str] | None = None,
     ) -> None:
         self.case_root = Path(case_root)
         self.condition_file = condition_file
@@ -192,6 +226,8 @@ class CaseFolderNpyDataset(Dataset):
         self.train_ratio = train_ratio
         self.value_range = value_range
         self.clip_range = clip_range
+        self.target_mode = target_mode
+        self.side_labels = list(side_labels) if side_labels is not None else None
         self.samples = self._build_samples(case_names_file)
         if not self.samples:
             raise ValueError("No case-folder .npy samples were found.")
@@ -238,13 +274,28 @@ class CaseFolderNpyDataset(Dataset):
                             break
                         target_paths.append(target_path)
                     if valid:
-                        samples.append(
-                            SampleSpec(
-                                name=f"{case_name}__{variant}",
-                                condition_path=condition_path,
-                                target_paths=target_paths,
+                        if self.target_mode == "side_emb":
+                            labels = self.side_labels or [_infer_side_label(path) for path in target_paths]
+                            label_to_idx = {label: idx for idx, label in enumerate(labels)}
+                            for target_path in target_paths:
+                                label = _infer_side_label(target_path)
+                                side_id = label_to_idx[label]
+                                samples.append(
+                                    SampleSpec(
+                                        name=f"{case_name}__{variant}__{label}",
+                                        condition_path=condition_path,
+                                        target_paths=[target_path],
+                                        side_id=side_id,
+                                    )
+                                )
+                        else:
+                            samples.append(
+                                SampleSpec(
+                                    name=f"{case_name}__{variant}",
+                                    condition_path=condition_path,
+                                    target_paths=target_paths,
+                                )
                             )
-                        )
                 continue
             for pattern in self.include_patterns:
                 condition_path = case_dir / pattern
@@ -279,7 +330,10 @@ class CaseFolderNpyDataset(Dataset):
         sample = self.samples[index]
         condition = self._load_single(sample.condition_path)
         target = torch.cat([self._load_single(path) for path in sample.target_paths], dim=0)
-        return {"name": sample.name, "condition": condition, "target": target}
+        ret: dict[str, torch.Tensor | str] = {"name": sample.name, "condition": condition, "target": target}
+        if sample.side_id is not None:
+            ret["side_id"] = torch.tensor(sample.side_id, dtype=torch.long)
+        return ret
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -295,3 +349,10 @@ class CaseFolderNpyDataset(Dataset):
         first = self[0]["target"]
         assert isinstance(first, torch.Tensor)
         return int(first.shape[0])
+
+    @property
+    def num_side_classes(self) -> int:
+        if self.target_mode != "side_emb":
+            return 0
+        labels = self.side_labels or []
+        return len(labels) if labels else 2

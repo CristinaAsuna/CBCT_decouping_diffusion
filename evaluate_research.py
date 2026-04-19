@@ -18,6 +18,8 @@ def build_dataset(dataset_cfg: dict):
         "normalize": dataset_cfg.get("normalize", "range_m11"),
         "value_range": dataset_cfg.get("value_range"),
         "clip_range": dataset_cfg.get("clip_range"),
+        "target_mode": dataset_cfg.get("target_mode", "multi_channel"),
+        "side_labels": dataset_cfg.get("side_labels"),
     }
     if dataset_type == "paired_dirs":
         return NpyConditionTargetDataset(

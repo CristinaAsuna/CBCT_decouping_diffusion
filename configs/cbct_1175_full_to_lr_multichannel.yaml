@@ -1,0 +1,86 @@
+seed: 1234
+device: null
+
+dataset:
+  train:
+    type: "case_folders"
+    case_root: "D:/nnunet/2D_test_v2"
+    split: "train"
+    split_seed: 1234
+    train_ratio: 0.9
+    variants: ["std", "aug"]
+    condition_template: "{variant}_full.npy"
+    target_templates:
+      - "{variant}_left.npy"
+      - "{variant}_right.npy"
+    target_mode: "multi_channel"
+    image_size: [256, 256]
+    normalize: "fixed_range_m11"
+    value_range: [0.0, 6.0]
+    clip_range: [0.0, 6.0]
+  val:
+    type: "case_folders"
+    case_root: "D:/nnunet/2D_test_v2"
+    split: "val"
+    split_seed: 1234
+    train_ratio: 0.9
+    variants: ["std", "aug"]
+    condition_template: "{variant}_full.npy"
+    target_templates:
+      - "{variant}_left.npy"
+      - "{variant}_right.npy"
+    target_mode: "multi_channel"
+    image_size: [256, 256]
+    normalize: "fixed_range_m11"
+    value_range: [0.0, 6.0]
+    clip_range: [0.0, 6.0]
+
+model:
+  image_size: 256
+  inner_channel: 64
+  channel_mults: [1, 2, 4]
+  attn_res: []
+  res_blocks: 1
+  dropout: 0.2
+
+diffusion:
+  beta_schedule:
+    schedule: "linear"
+    n_timestep: 1000
+    linear_start: 0.0001
+    linear_end: 0.02
+
+train:
+  max_steps: 30000
+  batch_size: 4
+  val_batch_size: 4
+  num_workers: 0
+  lr: 0.00005
+  weight_decay: 0.0
+  resume_checkpoint: null
+  ema_decay: 0.9999
+  ema_start_step: 100
+  validate_every_steps: 1000
+  save_every_steps: 5000
+  log_every_steps: 50
+  best_metric: "val_mae"
+
+validation:
+  max_batches: 10
+  fid_every_steps: 0
+  sampler:
+    sampler: "ddim"
+    steps: 50
+    eta: 0.0
+
+logging:
+  use_swanlab: true
+  project: "palette_decoupling_cbct"
+  experiment_name: "cbct_1175_full_to_lr_multichannel"
+  mode: null
+  logdir: null
+  run_id: null
+  resume: null
+
+output:
+  root: "D:/vscode_workplace/codeplace/palette/outputs/cbct_1175_full_to_lr_multichannel"

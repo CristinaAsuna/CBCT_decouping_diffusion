@@ -205,6 +205,7 @@ class UNet(nn.Module):
         use_scale_shift_norm: bool = True,
         resblock_updown: bool = True,
         use_new_attention_order: bool = False,
+        num_side_classes: int = 0,
     ):
         super().__init__()
         if num_heads_upsample == -1:
@@ -213,6 +214,7 @@ class UNet(nn.Module):
         self.dtype = torch.float16 if use_fp16 else torch.float32
         cond_embed_dim = inner_channel * 4
         self.cond_embed = nn.Sequential(nn.Linear(inner_channel, cond_embed_dim), SiLU(), nn.Linear(cond_embed_dim, cond_embed_dim))
+        self.side_emb = nn.Embedding(num_side_classes, cond_embed_dim) if num_side_classes > 0 else None
 
         ch = input_ch = int(channel_mults[0] * inner_channel)
         self.input_blocks = nn.ModuleList([EmbedSequential(nn.Conv2d(in_channel, ch, 3, padding=1))])
@@ -266,9 +268,13 @@ class UNet(nn.Module):
                 self.output_blocks.append(EmbedSequential(*layers))
         self.out = nn.Sequential(normalization(ch), SiLU(), zero_module(nn.Conv2d(input_ch, out_channel, 3, padding=1)))
 
-    def forward(self, x: torch.Tensor, gammas: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, gammas: torch.Tensor, side_ids: torch.Tensor | None = None) -> torch.Tensor:
         hs = []
         emb = self.cond_embed(gamma_embedding(gammas.view(-1), self.inner_channel))
+        if self.side_emb is not None:
+            if side_ids is None:
+                raise ValueError("side_ids is required when num_side_classes > 0")
+            emb = emb + self.side_emb(side_ids.view(-1))
         h = x.type(torch.float32)
         for module in self.input_blocks:
             h = module(h, emb)
