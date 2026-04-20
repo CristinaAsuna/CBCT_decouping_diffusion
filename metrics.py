@@ -7,7 +7,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .utils import save_tensor_png
+try:
+    from .utils import save_tensor_png
+except ImportError:
+    from utils import save_tensor_png
 
 
 def mae(pred: torch.Tensor, target: torch.Tensor) -> float:

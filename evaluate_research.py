@@ -6,9 +6,14 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .config import load_config
-from .dataset import CaseFolderNpyDataset, NpyConditionTargetDataset
-from .metrics import compute_channelwise_fid, mae, mse, psnr, ssim
+try:
+    from .config import load_config
+    from .dataset import CaseFolderNpyDataset, NpyConditionTargetDataset
+    from .metrics import compute_channelwise_fid, mae, mse, psnr, ssim
+except ImportError:
+    from config import load_config
+    from dataset import CaseFolderNpyDataset, NpyConditionTargetDataset
+    from metrics import compute_channelwise_fid, mae, mse, psnr, ssim
 
 
 def build_dataset(dataset_cfg: dict):
@@ -18,7 +23,9 @@ def build_dataset(dataset_cfg: dict):
         "normalize": dataset_cfg.get("normalize", "range_m11"),
         "value_range": dataset_cfg.get("value_range"),
         "clip_range": dataset_cfg.get("clip_range"),
-        "target_mode": dataset_cfg.get("target_mode", "multi_channel"),
+        "target_mode": dataset_cfg.get("target_mode"),
+        "target_side": dataset_cfg.get("target_side"),
+        "target_sides": dataset_cfg.get("target_sides"),
         "side_labels": dataset_cfg.get("side_labels"),
     }
     if dataset_type == "paired_dirs":
@@ -38,6 +45,7 @@ def build_dataset(dataset_cfg: dict):
             variants=dataset_cfg.get("variants"),
             condition_template=dataset_cfg.get("condition_template"),
             target_templates=dataset_cfg.get("target_templates"),
+            target_template=dataset_cfg.get("target_template"),
             split=dataset_cfg.get("split"),
             split_seed=dataset_cfg.get("split_seed", 1234),
             train_ratio=dataset_cfg.get("train_ratio", 0.9),
@@ -51,11 +59,15 @@ def main() -> None:
     parser.add_argument("--config", required=True)
     parser.add_argument("--pred-dir", required=True)
     parser.add_argument("--split", default="val", choices=["train", "val", "test"])
+    parser.add_argument("--case-root", default=None, help="Optional override for dataset.case_root")
     parser.add_argument("--with-fid", action="store_true")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    dataset = build_dataset(cfg["dataset"][args.split])
+    dataset_cfg = dict(cfg["dataset"][args.split])
+    if args.case_root is not None:
+        dataset_cfg["case_root"] = args.case_root
+    dataset = build_dataset(dataset_cfg)
     pred_dir = Path(args.pred_dir)
     preds = []
     targets = []

@@ -4,28 +4,38 @@ device: null
 dataset:
   train:
     type: "case_folders"
-    case_root: "D:/nnunet/2D_test_v2"
+    case_root: "D:/nnunet/2D"
     split: "train"
     split_seed: 1234
     train_ratio: 0.9
     variants: ["std", "aug"]
     condition_template: "{variant}_full.npy"
-    target_templates:
-      - "{variant}_left.npy"
+    target_mode: "single"
+    target_side: "left"
+    target_sides: ["left", "right"]
+    target_template: "{variant}_{side}.npy"
+    side_labels:
+      left: 0
+      right: 1
     image_size: [256, 256]
     normalize: "fixed_range_m11"
     value_range: [0.0, 6.0]
     clip_range: [0.0, 6.0]
   val:
     type: "case_folders"
-    case_root: "D:/nnunet/2D_test_v2"
+    case_root: "D:/nnunet/2D"
     split: "val"
     split_seed: 1234
     train_ratio: 0.9
     variants: ["std", "aug"]
     condition_template: "{variant}_full.npy"
-    target_templates:
-      - "{variant}_left.npy"
+    target_mode: "single"
+    target_side: "left"
+    target_sides: ["left", "right"]
+    target_template: "{variant}_{side}.npy"
+    side_labels:
+      left: 0
+      right: 1
     image_size: [256, 256]
     normalize: "fixed_range_m11"
     value_range: [0.0, 6.0]
@@ -34,7 +44,7 @@ dataset:
 model:
   image_size: 256
   inner_channel: 64
-  channel_mults: [1, 2, 4,8]
+  channel_mults: [1, 2, 4, 8]
   attn_res: [16]
   res_blocks: 2
   dropout: 0.2
@@ -54,12 +64,10 @@ train:
   lr: 0.00005
   lr_schedule:
     enabled: true
-    type: "step"
-    steps:
-      - step: 300000
-        lr: 0.00002
-      - step: 350000
-        lr: 0.00001
+    type: "cosine_with_warmup"
+    warmup_steps: 10000
+    warmup_start_lr: 0.0
+    min_lr: 0.000001
   weight_decay: 0.0
   resume_checkpoint: null
   ema_decay: 0.9999
@@ -87,11 +95,11 @@ validation:
 logging:
   use_swanlab: true
   project: "palette_decoupling_cbct"
-  experiment_name: "cbct_1175_full_to_left_step_baseline"
+  experiment_name: "full_to_left_single"
   mode: null
   logdir: null
   run_id: null
   resume: null
 
 output:
-  root: "D:/vscode_workplace/codeplace/palette/outputs/cbct_1175_full_to_left_step_baseline"
+  root: "D:/vscode_workplace/codeplace/palette/outputs/full_to_left_single"

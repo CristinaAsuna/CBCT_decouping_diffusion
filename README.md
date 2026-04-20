@@ -1,50 +1,28 @@
-# palette_decoupling
+# CBCT Decoupling Diffusion 使用说明
 
-一个面向医学 `.npy` 数据的简化版 Palette 条件扩散基线工程。目标是保留 Palette 的核心思路，同时把原始项目里不利于快速改医学任务的实验框架解耦出来，方便直接做 `full -> left/right` 这类投影生成任务。
+这是一份新的项目说明文档，不会覆盖现有的 `README.md`。
 
-## 核心思路
+当前项目已经支持以下几类任务：
 
-- 数据直接读取 `.npy`
-- 条件扩散的输入是 `concat(condition, noisy_target)`
-- 支持一个 `condition` 对一个或多个 target 通道
-- 支持病例文件夹结构，自动保证同一个病例内 `std` 和 `aug` 各自严格配对
+- `full -> left` 单边生成
+- `full -> [left, right]` 双通道联合生成
+- `full -> side-conditioned single output`，通过 `side_emb` 控制输出 `left/right`
 
-例如：
+同时支持：
 
-```text
-input to denoiser = concat(condition, noisy_target)
-condition = full
-target = left
-```
+- DDPM / DDIM 推理
+- EMA 权重
+- `best_ema.pt`、`best_ema_mae.pt`、`best_ema_ssim.pt`
+- `step` 学习率调度
+- `cosine_with_warmup` 学习率调度
+- 基于 `MAE + SSIM` 的 early stopping
 
-或者：
+## 1. 目录结构
 
-```text
-input to denoiser = concat(condition, noisy_target)
-condition = full
-target = [left, right]
-```
-
-## 支持的数据组织
-
-### 1. 平铺目录
+推荐的数据目录形式如下：
 
 ```text
-train/
-  full/
-    0001.npy
-  left/
-    0001.npy
-  right/
-    0001.npy
-```
-
-按同名自动配对。
-
-### 2. 病例文件夹
-
-```text
-D:/nnunet/2D_test_v2/
+D:/nnunet/2D/
   Bone_0001/
     std_full.npy
     std_left.npy
@@ -52,105 +30,296 @@ D:/nnunet/2D_test_v2/
     aug_full.npy
     aug_left.npy
     aug_right.npy
-    meta.json
   Bone_0002/
   ...
 ```
 
-对于病例文件夹模式，当前工程支持：
+其中：
 
-- `std_full -> std_left`
-- `aug_full -> aug_left`
-- `std_full -> [std_left, std_right]`
-- `aug_full -> [aug_left, aug_right]`
+- `*_full.npy` 是条件输入
+- `*_left.npy` 是左侧目标
+- `*_right.npy` 是右侧目标
+- `std` / `aug` 是两个变体
 
-不会把 `std_full` 错配到 `aug_left/right`。
+## 2. 配置文件
 
-## 目前推荐的研究版 baseline
+项目中已经提供了三份可直接使用的配置：
 
-当前更推荐使用研究版入口：
+- [configs/full_to_left_single.yaml](/D:/vscode_workplace/codeplace/palette/visual/CBCT_decouping_diffusion/configs/full_to_left_single.yaml)
+- [configs/full_to_dual.yaml](/D:/vscode_workplace/codeplace/palette/visual/CBCT_decouping_diffusion/configs/full_to_dual.yaml)
+- [configs/full_to_sidecond.yaml](/D:/vscode_workplace/codeplace/palette/visual/CBCT_decouping_diffusion/configs/full_to_sidecond.yaml)
 
-- `train_research.py`
-- `infer_research.py`
-- `evaluate_research.py`
+它们分别对应：
 
-它们支持：
+- `full_to_left_single.yaml`
+  训练 `full -> left`
+- `full_to_dual.yaml`
+  训练 `full -> [left, right]`
+- `full_to_sidecond.yaml`
+  训练 side-conditioned 模型，单模型可生成 `left` 或 `right`
 
-- 按病例级 `train/val/test` 划分
-- 固定强度范围归一化，例如 `[0, 6] -> [-1, 1]`
-- `step` 驱动训练，而不是按 epoch 决策
-- EMA 权重
-- DDIM 风格快速采样
-- checkpoint 保存与 resume
-- 可选 FID
+如果在服务器上训练，请先把下面这些路径改成服务器路径：
 
-## 推荐配置
+- `dataset.train.case_root`
+- `dataset.val.case_root`
+- `output.root`
 
-对于目前的 `1175 case, full -> left` baseline，推荐配置：
+## 3. 训练
 
-- `palette_decoupling/configs/cbct_1175_full_to_left_step_baseline.yaml`
+### 3.1 full -> left
 
-这份配置默认：
-
-- 使用病例级 `90% train / 10% val`
-- 每个病例同时包含 `std` 和 `aug`
-- 输入分辨率 `256 x 256`
-- 强度范围按 `[0, 6]` 裁剪并映射到 `[-1, 1]`
-- 使用 EMA
-- 每 `1000` step 验证一次
-- 默认用 DDIM `50 steps` 做验证采样
-- 默认关闭训练中的 FID，避免离线集群下载 Inception 权重时报错
-
-## 训练
-
-### 常规训练
-
-```bash
-python -m palette_decoupling.train_research --config palette_decoupling/configs/cbct_1175_full_to_left_step_baseline.yaml
+```powershell
+python -m CBCT_decouping_diffusion.train_research --config CBCT_decouping_diffusion/configs/full_to_left_single.yaml
 ```
 
-### 断点续训
+### 3.2 full -> [left, right]
 
-```bash
-python -m palette_decoupling.train_research \
-  --config palette_decoupling/configs/cbct_1175_full_to_left_step_baseline.yaml \
+```powershell
+python -m CBCT_decouping_diffusion.train_research --config CBCT_decouping_diffusion/configs/full_to_dual.yaml
+```
+
+### 3.3 full -> side-conditioned
+
+```powershell
+python -m CBCT_decouping_diffusion.train_research --config CBCT_decouping_diffusion/configs/full_to_sidecond.yaml
+```
+
+### 3.4 断点续训
+
+```powershell
+python -m CBCT_decouping_diffusion.train_research `
+  --config CBCT_decouping_diffusion/configs/full_to_left_single.yaml `
   --resume /path/to/checkpoints/last.pt
 ```
 
-当前 checkpoint 会保存：
+## 4. 训练模式说明
 
-- `model`
-- `ema_model`
-- `optimizer`
-- `step`
-- `best_metric`
+### 4.1 single
 
-恢复训练时会自动接着之前的 step 往下跑。
+配置关键项：
 
-## 推理
-
-研究版推理默认优先使用训练配置里的 DDIM 采样参数。
-
-```bash
-python -m palette_decoupling.infer_research \
-  --config palette_decoupling/configs/cbct_1175_full_to_left_step_baseline.yaml \
-  --checkpoint /path/to/checkpoints/best_ema.pt \
-  --split val \
-  --output-dir /path/to/infer_val_ema
+```yaml
+target_mode: "single"
+target_side: "left"
+target_template: "{variant}_{side}.npy"
 ```
 
-可选参数：
+含义：
 
-- `--weights ema`：优先加载 `ema_model`
-- `--weights model`：加载普通模型权重
+- 每个样本只取一个目标
+- 如果 `target_side: left`，训练的是 `full -> left`
+- 如果改成 `right`，训练的是 `full -> right`
 
-## 评估
+### 4.2 dual
 
-```bash
-python -m palette_decoupling.evaluate_research \
-  --config palette_decoupling/configs/cbct_1175_full_to_left_step_baseline.yaml \
-  --pred-dir /path/to/infer_val_ema \
-  --split val \
+配置关键项：
+
+```yaml
+target_mode: "dual"
+target_sides: ["left", "right"]
+target_template: "{variant}_{side}.npy"
+```
+
+含义：
+
+- 一个样本同时加载 `left` 和 `right`
+- 输出固定为双通道
+- `ch0 = left`
+- `ch1 = right`
+
+### 4.3 side_cond
+
+配置关键项：
+
+```yaml
+target_mode: "side_cond"
+target_sides: ["left", "right"]
+side_labels:
+  left: 0
+  right: 1
+```
+
+含义：
+
+- 训练时把 `left/right` 作为 side label
+- 模型内部使用 `side_emb + time_emb`
+- 仍然是单输出通道，但推理时可以通过 side 控制生成左侧或右侧
+
+## 5. 学习率与 Early Stop
+
+项目支持两类学习率调度：
+
+- `step`
+- `cosine_with_warmup`
+
+例如：
+
+```yaml
+lr_schedule:
+  enabled: true
+  type: "cosine_with_warmup"
+  warmup_steps: 10000
+  warmup_start_lr: 0.0
+  min_lr: 0.000001
+```
+
+当前 early stopping 使用综合分数：
+
+```text
+score = ssim_weight * val_ssim - mae_weight * val_mae
+```
+
+例如：
+
+```yaml
+early_stop:
+  enabled: true
+  patience_validations: 20
+  min_delta: 0.0002
+  score:
+    mae_weight: 1.0
+    ssim_weight: 1.0
+```
+
+## 6. 保存的权重
+
+训练过程中会保存：
+
+- `checkpoints/best_ema.pt`
+  按 `train.best_metric` 保存的主 best
+- `checkpoints/best_ema_mae.pt`
+  `val_mae` 最优
+- `checkpoints/best_ema_ssim.pt`
+  `val_ssim` 最优
+- `checkpoints/last.pt`
+  最近一次保存的 checkpoint
+- `checkpoints/step_xxxxxx.pt`
+  周期保存
+
+## 7. 推理
+
+### 7.1 单边模型推理
+
+```powershell
+python infer_research.py `
+  --config configs/full_to_left_single.yaml `
+  --checkpoint output/checkpoints/best_ema_mae.pt `
+  --split val `
+  --case-root D:/nnunet/2D `
+  --case-name Bone_0001 `
+  --variant std `
+  --output-dir output/infer/Bone_0001_std
+```
+
+### 7.2 双通道模型推理
+
+```powershell
+python infer_research.py `
+  --config configs/full_to_dual.yaml `
+  --checkpoint output/checkpoints/best_ema_ssim.pt `
+  --split val `
+  --case-root D:/nnunet/2D `
+  --case-name Bone_0001 `
+  --variant std `
+  --output-dir output/infer_dual/Bone_0001_std
+```
+
+输出结果中：
+
+- `*_ch0.png` 对应 left
+- `*_ch1.png` 对应 right
+
+### 7.3 side-conditioned 模型推理
+
+生成 `left`：
+
+```powershell
+python infer_research.py `
+  --config configs/full_to_sidecond.yaml `
+  --checkpoint output/checkpoints/best_ema_ssim.pt `
+  --split val `
+  --case-root D:/nnunet/2D `
+  --case-name Bone_0001 `
+  --variant std `
+  --side left `
+  --output-dir output/infer_side_left/Bone_0001_std
+```
+
+生成 `right`：
+
+```powershell
+python infer_research.py `
+  --config configs/full_to_sidecond.yaml `
+  --checkpoint output/checkpoints/best_ema_ssim.pt `
+  --split val `
+  --case-root D:/nnunet/2D `
+  --case-name Bone_0001 `
+  --variant std `
+  --side right `
+  --output-dir output/infer_side_right/Bone_0001_std
+```
+
+## 8. DDIM 采样过程可视化
+
+如果想导出采样过程：
+
+```powershell
+python infer_research.py `
+  --config configs/full_to_left_single.yaml `
+  --checkpoint output/checkpoints/best_ema_ssim.pt `
+  --split val `
+  --case-root D:/nnunet/2D `
+  --case-name Bone_0001 `
+  --variant aug `
+  --output-dir output/trace/Bone_0001_aug `
+  --save-trace `
+  --trace-channel 0
+```
+
+会生成：
+
+- `*_sampling.gif`
+  DDIM 当前采样状态演化
+- `*_predx0.gif`
+  每一步预测的 `x0_hat`
+- `*_sampling_grid.png`
+- `*_predx0_grid.png`
+- `*_trace/`
+  每一步单独 PNG
+
+## 9. 评估
+
+评估流程分两步：
+
+### 9.1 先批量推理
+
+```powershell
+python infer_research.py `
+  --config configs/full_to_left_single.yaml `
+  --checkpoint output/checkpoints/best_ema_mae.pt `
+  --split val `
+  --case-root D:/nnunet/2D `
+  --output-dir output/eval_preds/val_left
+```
+
+### 9.2 再计算指标
+
+```powershell
+python evaluate_research.py `
+  --config configs/full_to_left_single.yaml `
+  --split val `
+  --case-root D:/nnunet/2D `
+  --pred-dir output/eval_preds/val_left
+```
+
+如需 FID：
+
+```powershell
+python evaluate_research.py `
+  --config configs/full_to_left_single.yaml `
+  --split val `
+  --case-root D:/nnunet/2D `
+  --pred-dir output/eval_preds/val_left `
   --with-fid
 ```
 
@@ -162,131 +331,51 @@ python -m palette_decoupling.evaluate_research \
 - `SSIM`
 - `FID`
 
-注意：在离线集群环境里，`FID` 依赖 `cleanfid` 下载 Inception 权重。如果节点无法联网，建议训练时先关闭周期性 FID，等训练结束后再在有权重或可联网环境里单独评估。
+## 10. 评估时的注意事项
 
-## 输出目录说明
+### 10.1 不要复用旧的 pred 目录
 
-训练过程中常见输出：
+每换一个 checkpoint，建议换一个新的 `pred-dir`，避免旧预测和新预测混在一起。
 
-- `checkpoints/best_ema.pt`
-  当前最佳 EMA 权重
-- `checkpoints/last.pt`
-  最近一次保存的 checkpoint
-- `checkpoints/step_xxxxxx.pt`
-  周期性保存的断点
-- `samples/step_xxxxxx_<sample>_pred.npy`
-  该 step 下某个验证样本的原始预测数组
-- `samples/step_xxxxxx_<sample>_ch0.png`
-  该预测结果第 0 个通道的可视化图
+### 10.2 dual 模型的评估
 
-如果当前是 `full -> left` 单目标任务，那么：
+`full_to_dual.yaml` 下，评估会把预测的双通道结果和 `[left, right]` 真值一起比较。
 
-- `.npy` 通常形状接近 `1 x 256 x 256`
-- `ch0.png` 就是这个唯一输出通道的可视化
+### 10.3 side_cond 模型的评估
 
-## 日志与 SwanLab
+`full_to_sidecond.yaml` 下，dataset 会展开成：
 
-### 训练进度条和 SwanLab step 为什么不完全一样
+- `Bone_xxxx__std__left`
+- `Bone_xxxx__std__right`
 
-终端里的 `train steps` 是每次参数更新都加 1。
+所以推理和评估时，预测文件名也必须和这个样本命名一致。
 
-SwanLab 默认不是每一步都记录，而是按配置里的：
+## 11. 运行方式
 
-- `log_every_steps`
-- `validate_every_steps`
+如果按包方式运行，建议在项目上一级目录执行：
 
-来抽样记录训练和验证指标。
-
-因此：
-
-- 终端的 step 是真实全局 step
-- SwanLab 曲线是稀疏采样后的可视化
-
-最稳妥的做法是直接看 SwanLab 里记录点的 `step` 字段，而不是靠“第几个点”去换算。
-
-### SwanLab 在集群 local 模式下的注意事项
-
-如果集群节点无法联网，建议：
-
-```bash
-export SWANLAB_MODE="local"
+```powershell
+python -m CBCT_decouping_diffusion.train_research --config CBCT_decouping_diffusion/configs/full_to_left_single.yaml
 ```
 
-如果需要本地 dashboard 依赖，可手动安装：
+如果直接在当前目录运行，也已经兼容：
 
-```bash
-uv pip install "swanlab[dashboard]" --prerelease=allow
+```powershell
+python train_research.py --config configs/full_to_left_single.yaml
 ```
 
-### SwanLab 与 resume
+推理和评估脚本也支持同样两种方式。
 
-当前代码支持从环境变量读取：
+## 12. 建议的使用顺序
 
-- `SWANLAB_RUN_ID`
-- `SWANLAB_RESUME`
-- `SWANLAB_MODE`
-- `SWANLAB_LOGDIR`
+如果你想先做稳妥实验，建议顺序是：
 
-例如：
+1. 先跑 `full_to_left_single.yaml`
+2. 再跑 `full_to_dual.yaml`
+3. 最后试 `full_to_sidecond.yaml`
 
-```bash
-export SWANLAB_MODE="local"
-export SWANLAB_LOGDIR="/path/to/swanlog"
-export SWANLAB_RUN_ID="ib2mwwfgear8ctqvdujux"
-export SWANLAB_RESUME="allow"
-```
+原因是：
 
-但是要注意：
-
-- 训练 checkpoint 的 resume 是可靠的
-- SwanLab 在 `local` 模式下不一定能像 `cloud` 模式那样真正续写到同一个本地 run 目录
-- 在 `local` 模式下，更推荐把 SwanLab 当作本地分段日志，再通过 `swanlab sync` 做后续同步
-
-也就是说：
-
-- 模型断点续训：靠 `--resume last.pt`
-- SwanLab 本地记录：可能会新建一个 `run-*` 目录
-
-## 集群运行建议
-
-如果以包方式运行，请在包目录的上一级执行：
-
-```bash
-python -m CBCT_decouping_diffusion.train_research --config CBCT_decouping_diffusion/configs/xxx.yaml
-```
-
-不要直接：
-
-```bash
-python train_research.py
-```
-
-因为当前代码里使用了相对导入，直接脚本方式运行会报：
-
-```text
-ImportError: attempted relative import with no known parent package
-```
-
-
-加入真实侧位片inference
-```bash
-cd D:\vscode_workplace\codeplace\palette
-python -m palette_decoupling.infer_real_sideemb `
-  --config palette_decoupling/configs/cbct_1175_full_to_lr_sideemb.yaml `
-  --checkpoint D:\vscode_workplace\codeplace\palette\outputs\cbct_1175_full_to_lr_sideemb\checkpoints\best_ema.pt `
-  --input D:\your_real_ceph_images `
-  --output-dir D:\your_real_ceph_outputs `
-  --face-direction right `
-  --posterior-trim-ratio 0.18 `
-  --save-debug
-
-```
-
-
-## 当前最适合继续扩展的方向
-
-1. `full -> right` 镜像 baseline
-2. 双目标 `full -> [left, right]`
-3. 自动 early stopping
-4. 更医学任务相关的结构一致性指标
-5. 更严格的测试集独立评估与可视化报告
+- `single` 最稳定，最容易分析
+- `dual` 能直接看联合输出是否值得
+- `side_cond` 更灵活，但训练稳定性和可解释性更依赖实验结果

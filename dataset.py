@@ -81,16 +81,8 @@ class SampleSpec:
     name: str
     condition_path: Path
     target_paths: list[Path]
+    side_name: str | None = None
     side_id: int | None = None
-
-
-def _infer_side_label(path: Path) -> str:
-    stem = path.stem.lower()
-    if stem.endswith("_left"):
-        return "left"
-    if stem.endswith("_right"):
-        return "right"
-    return stem.split("_")[-1]
 
 
 class NpyConditionTargetDataset(Dataset):
@@ -103,8 +95,10 @@ class NpyConditionTargetDataset(Dataset):
         names_file: str | None = None,
         value_range: list[float] | None = None,
         clip_range: list[float] | None = None,
-        target_mode: str = "multi_channel",
-        side_labels: Iterable[str] | None = None,
+        target_mode: str | None = None,
+        target_side: str | None = None,
+        target_sides: Iterable[str] | None = None,
+        side_labels: dict[str, int] | None = None,
     ) -> None:
         self.condition_dir = Path(condition_dir)
         self.target_dirs = [Path(item) for item in target_dirs]
@@ -112,8 +106,10 @@ class NpyConditionTargetDataset(Dataset):
         self.normalize = normalize
         self.value_range = value_range
         self.clip_range = clip_range
-        self.target_mode = target_mode
-        self.side_labels = list(side_labels) if side_labels is not None else None
+        self.target_mode = target_mode or ("dual" if len(self.target_dirs) > 1 else "single")
+        self.target_side = target_side
+        self.target_sides = list(target_sides) if target_sides is not None else ["left", "right"]
+        self.side_labels = side_labels or {side: idx for idx, side in enumerate(self.target_sides)}
         self.samples = self._build_samples(names_file)
         if not self.samples:
             raise ValueError("No paired .npy samples were found.")
@@ -134,23 +130,44 @@ class NpyConditionTargetDataset(Dataset):
         for name in names:
             if name not in condition_map:
                 continue
+            if self.target_mode == "side_cond":
+                if len(target_maps) != len(self.target_sides):
+                    raise ValueError("target_mode=side_cond expects target_dirs and target_sides to have the same length")
+                for side_name, target_map in zip(self.target_sides, target_maps):
+                    target_path = target_map.get(name)
+                    if target_path is None:
+                        continue
+                    samples.append(
+                        SampleSpec(
+                            name=f"{name}__{side_name}",
+                            condition_path=condition_map[name],
+                            target_paths=[target_path],
+                            side_name=side_name,
+                            side_id=self.side_labels[side_name],
+                        )
+                    )
+                continue
+
+            if self.target_mode == "single":
+                if self.target_side is not None:
+                    if self.target_side not in self.target_sides:
+                        raise ValueError(f"Unsupported target_side: {self.target_side}")
+                    side_index = self.target_sides.index(self.target_side)
+                    target_maps_to_use = [target_maps[side_index]]
+                else:
+                    target_maps_to_use = target_maps[:1]
+            else:
+                target_maps_to_use = target_maps
+
             target_paths: list[Path] = []
-            for target_map in target_maps:
+            for target_map in target_maps_to_use:
                 target_path = target_map.get(name)
                 if target_path is None:
                     target_paths = []
                     break
                 target_paths.append(target_path)
             if target_paths:
-                if self.target_mode == "side_emb":
-                    labels = self.side_labels or [_infer_side_label(path) for path in target_paths]
-                    label_to_idx = {label: idx for idx, label in enumerate(labels)}
-                    for target_path in target_paths:
-                        label = _infer_side_label(target_path)
-                        side_id = label_to_idx[label]
-                        samples.append(SampleSpec(name=f"{name}__{label}", condition_path=condition_map[name], target_paths=[target_path], side_id=side_id))
-                else:
-                    samples.append(SampleSpec(name=name, condition_path=condition_map[name], target_paths=target_paths))
+                samples.append(SampleSpec(name=name, condition_path=condition_map[name], target_paths=target_paths))
         return samples
 
     def _load_single(self, path: Path) -> torch.Tensor:
@@ -163,10 +180,11 @@ class NpyConditionTargetDataset(Dataset):
         sample = self.samples[index]
         condition = self._load_single(sample.condition_path)
         target = torch.cat([self._load_single(path) for path in sample.target_paths], dim=0)
-        ret: dict[str, torch.Tensor | str] = {"name": sample.name, "condition": condition, "target": target}
-        if sample.side_id is not None:
-            ret["side_id"] = torch.tensor(sample.side_id, dtype=torch.long)
-        return ret
+        result: dict[str, torch.Tensor | str] = {"name": sample.name, "condition": condition, "target": target}
+        if sample.side_name is not None and sample.side_id is not None:
+            result["side_name"] = sample.side_name
+            result["side"] = torch.tensor(sample.side_id, dtype=torch.long)
+        return result
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -184,11 +202,10 @@ class NpyConditionTargetDataset(Dataset):
         return int(first.shape[0])
 
     @property
-    def num_side_classes(self) -> int:
-        if self.target_mode != "side_emb":
-            return 0
-        labels = self.side_labels or []
-        return len(labels) if labels else 2
+    def num_side_classes(self) -> int | None:
+        if not any(sample.side_id is not None for sample in self.samples):
+            return None
+        return len(self.side_labels)
 
 
 class CaseFolderNpyDataset(Dataset):
@@ -209,8 +226,11 @@ class CaseFolderNpyDataset(Dataset):
         train_ratio: float = 0.9,
         value_range: list[float] | None = None,
         clip_range: list[float] | None = None,
-        target_mode: str = "multi_channel",
-        side_labels: Iterable[str] | None = None,
+        target_mode: str | None = None,
+        target_side: str | None = None,
+        target_sides: Iterable[str] | None = None,
+        target_template: str | None = None,
+        side_labels: dict[str, int] | None = None,
     ) -> None:
         self.case_root = Path(case_root)
         self.condition_file = condition_file
@@ -226,8 +246,16 @@ class CaseFolderNpyDataset(Dataset):
         self.train_ratio = train_ratio
         self.value_range = value_range
         self.clip_range = clip_range
-        self.target_mode = target_mode
-        self.side_labels = list(side_labels) if side_labels is not None else None
+        inferred_mode = "single"
+        if target_mode is not None:
+            inferred_mode = target_mode
+        elif self.target_templates is not None and len(self.target_templates) > 1:
+            inferred_mode = "dual"
+        self.target_mode = inferred_mode
+        self.target_side = target_side
+        self.target_sides = list(target_sides) if target_sides is not None else ["left", "right"]
+        self.target_template = target_template
+        self.side_labels = side_labels or {side: idx for idx, side in enumerate(self.target_sides)}
         self.samples = self._build_samples(case_names_file)
         if not self.samples:
             raise ValueError("No case-folder .npy samples were found.")
@@ -253,6 +281,78 @@ class CaseFolderNpyDataset(Dataset):
             return sorted(case_names[split_index:])
         raise ValueError(f"Unsupported split: {self.split}")
 
+    def _resolve_target_paths_for_variant(self, case_dir: Path, variant: str) -> list[tuple[str | None, list[Path], int | None]]:
+        if self.target_mode == "side_cond":
+            outputs: list[tuple[str | None, list[Path], int | None]] = []
+            for side_name in self.target_sides:
+                if self.target_template is not None:
+                    target_path = case_dir / self.target_template.format(variant=variant, side=side_name)
+                else:
+                    target_path = case_dir / f"{variant}_{side_name}.npy"
+                if target_path.exists():
+                    outputs.append((side_name, [target_path], self.side_labels[side_name]))
+            return outputs
+
+        if self.target_mode == "single":
+            if self.target_templates is not None:
+                if len(self.target_templates) == 1:
+                    return [(None, [case_dir / self.target_templates[0].format(variant=variant)], None)]
+                raise ValueError("target_mode=single expects exactly one target_templates entry, or use target_template/target_side")
+            side_name = self.target_side or self.target_sides[0]
+            if self.target_template is not None:
+                return [(None, [case_dir / self.target_template.format(variant=variant, side=side_name)], None)]
+            return [(None, [case_dir / f"{variant}_{side_name}.npy"], None)]
+
+        if self.target_mode == "dual":
+            if self.target_templates is not None:
+                target_paths = [case_dir / template.format(variant=variant) for template in self.target_templates]
+            else:
+                if self.target_template is not None:
+                    target_paths = [case_dir / self.target_template.format(variant=variant, side=side_name) for side_name in self.target_sides]
+                else:
+                    target_paths = [case_dir / f"{variant}_{side_name}.npy" for side_name in self.target_sides]
+            return [(None, target_paths, None)]
+
+        raise ValueError(f"Unsupported target_mode: {self.target_mode}")
+
+    def _resolve_target_paths_for_pattern(self, case_dir: Path, pattern: str) -> list[tuple[str | None, list[Path], int | None]]:
+        stem = Path(pattern).stem
+        if self.target_mode == "side_cond":
+            outputs: list[tuple[str | None, list[Path], int | None]] = []
+            for side_name in self.target_sides:
+                if self.target_template is not None:
+                    target_path = case_dir / self.target_template.format(pattern_stem=stem, side=side_name)
+                else:
+                    target_path = case_dir / f"{side_name}.npy"
+                if target_path.exists():
+                    outputs.append((side_name, [target_path], self.side_labels[side_name]))
+            return outputs
+
+        if self.target_mode == "single":
+            if self.target_files:
+                if len(self.target_files) == 1:
+                    return [(None, [case_dir / self.target_files[0]], None)]
+                raise ValueError("target_mode=single expects exactly one target_files entry")
+            side_name = self.target_side or self.target_sides[0]
+            if self.target_template is not None:
+                return [(None, [case_dir / self.target_template.format(pattern_stem=stem, side=side_name)], None)]
+            return [(None, [case_dir / f"{side_name}.npy"], None)]
+
+        if self.target_mode == "dual":
+            if self.target_files:
+                return [(None, [case_dir / target_file for target_file in self.target_files], None)]
+            if self.target_template is not None:
+                return [
+                    (
+                        None,
+                        [case_dir / self.target_template.format(pattern_stem=stem, side=side_name) for side_name in self.target_sides],
+                        None,
+                    )
+                ]
+            return [(None, [case_dir / f"{side_name}.npy" for side_name in self.target_sides], None)]
+
+        raise ValueError(f"Unsupported target_mode: {self.target_mode}")
+
     def _build_samples(self, case_names_file: str | None) -> list[SampleSpec]:
         case_names = self._resolve_case_names(case_names_file)
         samples: list[SampleSpec] = []
@@ -260,62 +360,44 @@ class CaseFolderNpyDataset(Dataset):
             case_dir = self.case_root / case_name
             if not case_dir.is_dir():
                 continue
-            if self.variants is not None and self.condition_template is not None and self.target_templates is not None:
+            if self.variants is not None and self.condition_template is not None:
                 for variant in self.variants:
                     condition_path = case_dir / self.condition_template.format(variant=variant)
                     if not condition_path.exists():
                         continue
-                    target_paths: list[Path] = []
-                    valid = True
-                    for target_template in self.target_templates:
-                        target_path = case_dir / target_template.format(variant=variant)
-                        if not target_path.exists():
-                            valid = False
-                            break
-                        target_paths.append(target_path)
-                    if valid:
-                        if self.target_mode == "side_emb":
-                            labels = self.side_labels or [_infer_side_label(path) for path in target_paths]
-                            label_to_idx = {label: idx for idx, label in enumerate(labels)}
-                            for target_path in target_paths:
-                                label = _infer_side_label(target_path)
-                                side_id = label_to_idx[label]
-                                samples.append(
-                                    SampleSpec(
-                                        name=f"{case_name}__{variant}__{label}",
-                                        condition_path=condition_path,
-                                        target_paths=[target_path],
-                                        side_id=side_id,
-                                    )
-                                )
-                        else:
-                            samples.append(
-                                SampleSpec(
-                                    name=f"{case_name}__{variant}",
-                                    condition_path=condition_path,
-                                    target_paths=target_paths,
-                                )
+                    targets = self._resolve_target_paths_for_variant(case_dir, variant)
+                    for side_name, target_paths, side_id in targets:
+                        valid = all(path.exists() for path in target_paths)
+                        if not valid:
+                            continue
+                        sample_name = f"{case_name}__{variant}" if side_name is None else f"{case_name}__{variant}__{side_name}"
+                        samples.append(
+                            SampleSpec(
+                                name=sample_name,
+                                condition_path=condition_path,
+                                target_paths=target_paths,
+                                side_name=side_name,
+                                side_id=side_id,
                             )
+                        )
                 continue
             for pattern in self.include_patterns:
                 condition_path = case_dir / pattern
                 if not condition_path.exists():
                     continue
-                target_paths: list[Path] = []
-                valid = True
-                for target_file in self.target_files:
-                    target_path = case_dir / target_file
-                    if not target_path.exists():
-                        valid = False
-                        break
-                    target_paths.append(target_path)
-                if valid:
-                    sample_name = f"{case_name}__{Path(pattern).stem}"
+                targets = self._resolve_target_paths_for_pattern(case_dir, pattern)
+                for side_name, target_paths, side_id in targets:
+                    valid = all(path.exists() for path in target_paths)
+                    if not valid:
+                        continue
+                    sample_name = f"{case_name}__{Path(pattern).stem}" if side_name is None else f"{case_name}__{Path(pattern).stem}__{side_name}"
                     samples.append(
                         SampleSpec(
                             name=sample_name,
                             condition_path=condition_path,
                             target_paths=target_paths,
+                            side_name=side_name,
+                            side_id=side_id,
                         )
                     )
         return samples
@@ -330,10 +412,11 @@ class CaseFolderNpyDataset(Dataset):
         sample = self.samples[index]
         condition = self._load_single(sample.condition_path)
         target = torch.cat([self._load_single(path) for path in sample.target_paths], dim=0)
-        ret: dict[str, torch.Tensor | str] = {"name": sample.name, "condition": condition, "target": target}
-        if sample.side_id is not None:
-            ret["side_id"] = torch.tensor(sample.side_id, dtype=torch.long)
-        return ret
+        result: dict[str, torch.Tensor | str] = {"name": sample.name, "condition": condition, "target": target}
+        if sample.side_name is not None and sample.side_id is not None:
+            result["side_name"] = sample.side_name
+            result["side"] = torch.tensor(sample.side_id, dtype=torch.long)
+        return result
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -351,8 +434,7 @@ class CaseFolderNpyDataset(Dataset):
         return int(first.shape[0])
 
     @property
-    def num_side_classes(self) -> int:
-        if self.target_mode != "side_emb":
-            return 0
-        labels = self.side_labels or []
-        return len(labels) if labels else 2
+    def num_side_classes(self) -> int | None:
+        if not any(sample.side_id is not None for sample in self.samples):
+            return None
+        return len(self.side_labels)
