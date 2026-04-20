@@ -25,6 +25,10 @@ def build_dataset(dataset_cfg: dict):
         "normalize": dataset_cfg.get("normalize", "range_m11"),
         "value_range": dataset_cfg.get("value_range"),
         "clip_range": dataset_cfg.get("clip_range"),
+        "target_mode": dataset_cfg.get("target_mode"),
+        "target_side": dataset_cfg.get("target_side"),
+        "target_sides": dataset_cfg.get("target_sides"),
+        "side_labels": dataset_cfg.get("side_labels"),
     }
     if dataset_type == "paired_dirs":
         return NpyConditionTargetDataset(
@@ -43,6 +47,7 @@ def build_dataset(dataset_cfg: dict):
             variants=dataset_cfg.get("variants"),
             condition_template=dataset_cfg.get("condition_template"),
             target_templates=dataset_cfg.get("target_templates"),
+            target_template=dataset_cfg.get("target_template"),
             split=dataset_cfg.get("split"),
             split_seed=dataset_cfg.get("split_seed", 1234),
             train_ratio=dataset_cfg.get("train_ratio", 0.9),
@@ -63,6 +68,7 @@ def build_model(cfg: dict, dataset, device: torch.device) -> GaussianConditional
         res_blocks=cfg["model"]["res_blocks"],
         dropout=cfg["model"].get("dropout", 0.0),
         beta_schedule=cfg["diffusion"]["beta_schedule"],
+        num_side_classes=getattr(dataset, "num_side_classes", None),
     ).to(device)
 
 
@@ -70,23 +76,43 @@ def merge_infer_config(cli_cfg: dict, checkpoint_cfg: dict | None) -> dict:
     merged = copy.deepcopy(cli_cfg)
     if not checkpoint_cfg:
         return merged
-    for key in ("model", "diffusion", "validation"):
+    for key in ("dataset", "model", "diffusion", "validation"):
         if key in checkpoint_cfg:
             merged[key] = copy.deepcopy(checkpoint_cfg[key])
     return merged
 
 
-def run_sampler(model: GaussianConditionalDiffusion, condition: torch.Tensor, sample_cfg: dict) -> torch.Tensor:
+def run_sampler(
+    model: GaussianConditionalDiffusion,
+    condition: torch.Tensor,
+    sample_cfg: dict,
+    side_labels: torch.Tensor | None = None,
+) -> torch.Tensor:
     sampler = sample_cfg.get("sampler", "ddim")
     steps = sample_cfg.get("steps", 50)
     if sampler == "ddim":
-        return model.sample_ddim(condition, sample_steps=steps, eta=sample_cfg.get("eta", 0.0))
+        return model.sample_ddim(condition, sample_steps=steps, eta=sample_cfg.get("eta", 0.0), side_labels=side_labels)
     if sampler == "ddpm":
-        return model.sample(condition, sample_steps=steps)
+        return model.sample(condition, sample_steps=steps, side_labels=side_labels)
     raise ValueError(f"Unsupported sampler: {sampler}")
 
 
-def select_sample(dataset, case_name: str | None = None, variant: str | None = None, sample_name: str | None = None):
+def get_sample_side_label(sample: dict, device: torch.device) -> torch.Tensor | None:
+    side = sample.get("side")
+    if side is None:
+        return None
+    if not isinstance(side, torch.Tensor):
+        raise TypeError("sample['side'] must be a torch.Tensor")
+    return side.unsqueeze(0).to(device=device, dtype=torch.long) if side.ndim == 0 else side.to(device=device, dtype=torch.long)
+
+
+def select_sample(
+    dataset,
+    case_name: str | None = None,
+    variant: str | None = None,
+    sample_name: str | None = None,
+    side: str | None = None,
+):
     if sample_name is not None:
         for sample in dataset:
             if str(sample["name"]) == sample_name:
@@ -99,10 +125,12 @@ def select_sample(dataset, case_name: str | None = None, variant: str | None = N
     prefix = f"{case_name}__"
     matches = [sample for sample in dataset if str(sample["name"]).startswith(prefix)]
     if variant is not None:
-        target_name = f"{case_name}__{variant}"
-        matches = [sample for sample in matches if str(sample["name"]) == target_name]
+        variant_prefix = f"{case_name}__{variant}"
+        matches = [sample for sample in matches if str(sample["name"]).startswith(variant_prefix)]
+    if side is not None:
+        matches = [sample for sample in matches if str(sample.get("side_name", "")) == side or str(sample["name"]).endswith(f"__{side}")]
     if not matches:
-        raise ValueError(f"No sample found for case_name={case_name}, variant={variant}")
+        raise ValueError(f"No sample found for case_name={case_name}, variant={variant}, side={side}")
     return matches[0]
 
 
@@ -147,6 +175,7 @@ def main() -> None:
     parser.add_argument("--case-root", default=None, help="Optional override for dataset.case_root")
     parser.add_argument("--case-name", default=None, help="Case folder name such as Bone_0001")
     parser.add_argument("--variant", default=None, help="Variant suffix such as std or aug")
+    parser.add_argument("--side", default=None, help="Optional side label such as left or right")
     parser.add_argument("--sample-name", default=None, help="Exact sample name, e.g. Bone_0001__std")
     parser.add_argument("--save-trace", action="store_true", help="Save DDIM intermediate sampling results")
     parser.add_argument("--trace-channel", type=int, default=0, help="Target channel index to visualize")
@@ -181,7 +210,7 @@ def main() -> None:
     sampler_cfg = cfg.get("validation", {}).get("sampler", {"sampler": "ddim", "steps": 50, "eta": 0.0})
     selected_sample = None
     if args.case_name is not None or args.sample_name is not None:
-        selected_sample = select_sample(dataset, case_name=args.case_name, variant=args.variant, sample_name=args.sample_name)
+        selected_sample = select_sample(dataset, case_name=args.case_name, variant=args.variant, sample_name=args.sample_name, side=args.side)
         dataset_iterable = [selected_sample]
     else:
         dataset_iterable = dataset
@@ -191,12 +220,14 @@ def main() -> None:
             if args.limit is not None and sample_idx >= args.limit:
                 break
             condition = sample["condition"].unsqueeze(0).to(device)
+            side_labels = get_sample_side_label(sample, device)
             name = str(sample["name"])
             if args.save_trace and sampler_cfg.get("sampler", "ddim") == "ddim":
                 trace = model.sample_ddim_trace(
                     condition,
                     sample_steps=int(sampler_cfg.get("steps", 50)),
                     eta=float(sampler_cfg.get("eta", 0.0)),
+                    side_labels=side_labels,
                 )
                 pred = trace["final"][0]
                 save_trace_visuals(
@@ -207,7 +238,7 @@ def main() -> None:
                     gif_duration_ms=args.gif_duration_ms,
                 )
             else:
-                pred = run_sampler(model, condition, sampler_cfg)[0]
+                pred = run_sampler(model, condition, sampler_cfg, side_labels=side_labels)[0]
 
             save_tensor_npy(sample["condition"], output_dir / f"{name}_condition.npy")
             save_tensor_png(sample["condition"][0:1], output_dir / f"{name}_condition_ch0.png")

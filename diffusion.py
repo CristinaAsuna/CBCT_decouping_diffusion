@@ -48,6 +48,7 @@ class GaussianConditionalDiffusion(nn.Module):
         res_blocks: int,
         dropout: float,
         beta_schedule: dict,
+        num_side_classes: int | None = None,
     ):
         super().__init__()
         self.target_channels = target_channels
@@ -61,6 +62,7 @@ class GaussianConditionalDiffusion(nn.Module):
             res_blocks=res_blocks,
             dropout=dropout,
             num_head_channels=32,
+            num_side_classes=num_side_classes,
         )
         self.loss_fn = nn.MSELoss()
         self.beta_schedule = beta_schedule
@@ -99,30 +101,41 @@ class GaussianConditionalDiffusion(nn.Module):
         posterior_log_variance = extract(self.posterior_log_variance_clipped, t, y_t.shape)
         return posterior_mean, posterior_log_variance
 
-    def p_mean_variance(self, y_t: torch.Tensor, t: torch.Tensor, y_cond: torch.Tensor):
+    def p_mean_variance(self, y_t: torch.Tensor, t: torch.Tensor, y_cond: torch.Tensor, side_labels: torch.Tensor | None = None):
         noise_level = extract(self.gammas, t, x_shape=(1, 1)).to(y_t.device)
-        noise_hat = self.denoise_fn(torch.cat([y_cond, y_t], dim=1), noise_level)
+        noise_hat = self.denoise_fn(torch.cat([y_cond, y_t], dim=1), noise_level, side=side_labels)
         y_0_hat = self.predict_start_from_noise(y_t, t=t, noise=noise_hat).clamp(-1.0, 1.0)
         return self.q_posterior(y_0_hat=y_0_hat, y_t=y_t, t=t)
 
     @torch.no_grad()
-    def p_sample(self, y_t: torch.Tensor, t: torch.Tensor, y_cond: torch.Tensor) -> torch.Tensor:
-        model_mean, model_log_variance = self.p_mean_variance(y_t=y_t, t=t, y_cond=y_cond)
+    def p_sample(self, y_t: torch.Tensor, t: torch.Tensor, y_cond: torch.Tensor, side_labels: torch.Tensor | None = None) -> torch.Tensor:
+        model_mean, model_log_variance = self.p_mean_variance(y_t=y_t, t=t, y_cond=y_cond, side_labels=side_labels)
         noise = torch.randn_like(y_t) if any(t > 0) else torch.zeros_like(y_t)
         return model_mean + noise * (0.5 * model_log_variance).exp()
 
     @torch.no_grad()
-    def sample(self, condition: torch.Tensor, sample_steps: int | None = None) -> torch.Tensor:
+    def sample(
+        self,
+        condition: torch.Tensor,
+        sample_steps: int | None = None,
+        side_labels: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         steps = sample_steps or self.num_timesteps
         y_t = torch.randn(condition.shape[0], self.target_channels, condition.shape[2], condition.shape[3], device=condition.device)
         for i in reversed(range(steps)):
             t = torch.full((condition.shape[0],), i, device=condition.device, dtype=torch.long)
-            y_t = self.p_sample(y_t, t, y_cond=condition)
+            y_t = self.p_sample(y_t, t, y_cond=condition, side_labels=side_labels)
         return y_t
 
     @torch.no_grad()
-    def sample_ddim(self, condition: torch.Tensor, sample_steps: int = 50, eta: float = 0.0) -> torch.Tensor:
-        return self.sample_ddim_trace(condition, sample_steps=sample_steps, eta=eta)["final"]
+    def sample_ddim(
+        self,
+        condition: torch.Tensor,
+        sample_steps: int = 50,
+        eta: float = 0.0,
+        side_labels: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.sample_ddim_trace(condition, sample_steps=sample_steps, eta=eta, side_labels=side_labels)["final"]
 
     @torch.no_grad()
     def sample_ddim_trace(
@@ -130,6 +143,7 @@ class GaussianConditionalDiffusion(nn.Module):
         condition: torch.Tensor,
         sample_steps: int = 50,
         eta: float = 0.0,
+        side_labels: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | list[torch.Tensor] | list[int]]:
         if sample_steps <= 0:
             raise ValueError("sample_steps must be positive")
@@ -143,7 +157,7 @@ class GaussianConditionalDiffusion(nn.Module):
         for t_now, t_prev in zip(time_pairs, prev_pairs):
             t = torch.full((batch,), int(t_now.item()), device=condition.device, dtype=torch.long)
             noise_level = extract(self.gammas, t, x_shape=(1, 1)).to(y_t.device)
-            noise_hat = self.denoise_fn(torch.cat([condition, y_t], dim=1), noise_level)
+            noise_hat = self.denoise_fn(torch.cat([condition, y_t], dim=1), noise_level, side=side_labels)
             y_0_hat = self.predict_start_from_noise(y_t, t=t, noise=noise_hat).clamp(-1.0, 1.0)
             predictions.append(y_0_hat.detach().cpu().clone())
             if int(t_prev.item()) < 0:
@@ -168,7 +182,7 @@ class GaussianConditionalDiffusion(nn.Module):
             "timesteps": timesteps,
         }
 
-    def forward(self, target: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
+    def forward(self, target: torch.Tensor, condition: torch.Tensor, side_labels: torch.Tensor | None = None) -> torch.Tensor:
         batch, *_ = target.shape
         t = torch.randint(1, self.num_timesteps, (batch,), device=target.device).long()
         gamma_t1 = extract(self.gammas, t - 1, x_shape=(1, 1))
@@ -176,5 +190,5 @@ class GaussianConditionalDiffusion(nn.Module):
         sample_gammas = (gamma_t2 - gamma_t1) * torch.rand((batch, 1), device=target.device) + gamma_t1
         noise = torch.randn_like(target)
         y_noisy = self.q_sample(target, sample_gammas.view(-1, 1, 1, 1), noise)
-        noise_hat = self.denoise_fn(torch.cat([condition, y_noisy], dim=1), sample_gammas.view(-1))
+        noise_hat = self.denoise_fn(torch.cat([condition, y_noisy], dim=1), sample_gammas.view(-1), side=side_labels)
         return self.loss_fn(noise_hat, noise)

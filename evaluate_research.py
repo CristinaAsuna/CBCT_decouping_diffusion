@@ -23,6 +23,10 @@ def build_dataset(dataset_cfg: dict):
         "normalize": dataset_cfg.get("normalize", "range_m11"),
         "value_range": dataset_cfg.get("value_range"),
         "clip_range": dataset_cfg.get("clip_range"),
+        "target_mode": dataset_cfg.get("target_mode"),
+        "target_side": dataset_cfg.get("target_side"),
+        "target_sides": dataset_cfg.get("target_sides"),
+        "side_labels": dataset_cfg.get("side_labels"),
     }
     if dataset_type == "paired_dirs":
         return NpyConditionTargetDataset(
@@ -41,6 +45,7 @@ def build_dataset(dataset_cfg: dict):
             variants=dataset_cfg.get("variants"),
             condition_template=dataset_cfg.get("condition_template"),
             target_templates=dataset_cfg.get("target_templates"),
+            target_template=dataset_cfg.get("target_template"),
             split=dataset_cfg.get("split"),
             split_seed=dataset_cfg.get("split_seed", 1234),
             train_ratio=dataset_cfg.get("train_ratio", 0.9),

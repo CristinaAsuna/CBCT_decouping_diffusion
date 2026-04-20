@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import math
 import os
 from itertools import cycle
 
@@ -23,6 +24,10 @@ def build_dataset(dataset_cfg: dict):
         "normalize": dataset_cfg.get("normalize", "range_m11"),
         "value_range": dataset_cfg.get("value_range"),
         "clip_range": dataset_cfg.get("clip_range"),
+        "target_mode": dataset_cfg.get("target_mode"),
+        "target_side": dataset_cfg.get("target_side"),
+        "target_sides": dataset_cfg.get("target_sides"),
+        "side_labels": dataset_cfg.get("side_labels"),
     }
     if dataset_type == "paired_dirs":
         return NpyConditionTargetDataset(
@@ -41,6 +46,7 @@ def build_dataset(dataset_cfg: dict):
             variants=dataset_cfg.get("variants"),
             condition_template=dataset_cfg.get("condition_template"),
             target_templates=dataset_cfg.get("target_templates"),
+            target_template=dataset_cfg.get("target_template"),
             split=dataset_cfg.get("split"),
             split_seed=dataset_cfg.get("split_seed", 1234),
             train_ratio=dataset_cfg.get("train_ratio", 0.9),
@@ -117,13 +123,18 @@ class EMA:
                 value.mul_(self.decay).add_(model_state[key], alpha=1.0 - self.decay)
 
 
-def run_sampler(model: GaussianConditionalDiffusion, condition: torch.Tensor, sample_cfg: dict) -> torch.Tensor:
+def run_sampler(
+    model: GaussianConditionalDiffusion,
+    condition: torch.Tensor,
+    sample_cfg: dict,
+    side_labels: torch.Tensor | None = None,
+) -> torch.Tensor:
     sampler = sample_cfg.get("sampler", "ddim")
     steps = sample_cfg.get("steps", 50)
     if sampler == "ddim":
-        return model.sample_ddim(condition, sample_steps=steps, eta=sample_cfg.get("eta", 0.0))
+        return model.sample_ddim(condition, sample_steps=steps, eta=sample_cfg.get("eta", 0.0), side_labels=side_labels)
     if sampler == "ddpm":
-        return model.sample(condition, sample_steps=steps)
+        return model.sample(condition, sample_steps=steps, side_labels=side_labels)
     raise ValueError(f"Unsupported sampler: {sampler}")
 
 
@@ -131,6 +142,62 @@ def is_better_metric(metric_name: str, current: float, best: float) -> bool:
     if metric_name in {"val_ssim", "psnr", "val_psnr"}:
         return current > best
     return current < best
+
+
+def resolve_step_lr(train_cfg: dict, step: int) -> float:
+    base_lr = float(train_cfg["lr"])
+    schedule_cfg = train_cfg.get("lr_schedule", {})
+    if not schedule_cfg or not schedule_cfg.get("enabled", False):
+        return base_lr
+    schedule_type = schedule_cfg.get("type", "step")
+    if schedule_type == "step":
+        current_lr = base_lr
+        schedule_steps = schedule_cfg.get("steps", [])
+        for item in sorted(schedule_steps, key=lambda entry: int(entry["step"])):
+            if step >= int(item["step"]):
+                current_lr = float(item["lr"])
+            else:
+                break
+        return current_lr
+    if schedule_type in {"cosine", "cosine_with_warmup"}:
+        max_steps = int(train_cfg["max_steps"])
+        warmup_steps = int(schedule_cfg.get("warmup_steps", 0))
+        warmup_start_lr = float(schedule_cfg.get("warmup_start_lr", 0.0))
+        min_lr = float(schedule_cfg.get("min_lr", 0.0))
+        if warmup_steps > 0 and step <= warmup_steps:
+            warmup_progress = step / max(warmup_steps, 1)
+            return warmup_start_lr + warmup_progress * (base_lr - warmup_start_lr)
+        cosine_total = max(1, max_steps - warmup_steps)
+        cosine_progress = min(max((step - warmup_steps) / cosine_total, 0.0), 1.0)
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * cosine_progress))
+        return min_lr + (base_lr - min_lr) * cosine_decay
+    current_lr = base_lr
+    raise ValueError(f"Unsupported lr_schedule type: {schedule_type}")
+
+
+def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
+
+
+def get_optimizer_lr(optimizer: torch.optim.Optimizer) -> float:
+    return float(optimizer.param_groups[0]["lr"])
+
+
+def compute_early_stop_score(val_metrics: dict[str, float], early_stop_cfg: dict) -> float:
+    score_cfg = early_stop_cfg.get("score", {})
+    mae_weight = float(score_cfg.get("mae_weight", 1.0))
+    ssim_weight = float(score_cfg.get("ssim_weight", 1.0))
+    return ssim_weight * float(val_metrics["val_ssim"]) - mae_weight * float(val_metrics["val_mae"])
+
+
+def get_batch_side_labels(batch: dict, device: torch.device) -> torch.Tensor | None:
+    side = batch.get("side")
+    if side is None:
+        return None
+    if not isinstance(side, torch.Tensor):
+        raise TypeError("batch['side'] must be a torch.Tensor")
+    return side.to(device=device, dtype=torch.long)
 
 
 @torch.no_grad()
@@ -149,8 +216,9 @@ def validate(model, loader, device, sample_cfg: dict, max_batches: int | None = 
             break
         condition = batch["condition"].to(device)
         target = batch["target"].to(device)
-        loss = model(target, condition)
-        pred = run_sampler(model, condition, sample_cfg)
+        side_labels = get_batch_side_labels(batch, device)
+        loss = model(target, condition, side_labels=side_labels)
+        pred = run_sampler(model, condition, sample_cfg, side_labels=side_labels)
         losses.append(float(loss.item()))
         maes.append(mae(pred, target))
         mses.append(mse(pred, target))
@@ -187,6 +255,7 @@ def save_checkpoint(
     cfg: dict,
     best_metric: float | None = None,
     best_metrics: dict[str, float] | None = None,
+    training_state: dict | None = None,
 ) -> None:
     torch.save(
         {
@@ -197,12 +266,13 @@ def save_checkpoint(
             "step": step,
             "best_metric": best_metric,
             "best_metrics": best_metrics or {},
+            "training_state": training_state or {},
         },
         path,
     )
 
 
-def load_checkpoint(path, model, optimizer, ema: EMA, device: torch.device) -> tuple[int, float, dict[str, float]]:
+def load_checkpoint(path, model, optimizer, ema: EMA, device: torch.device) -> tuple[int, float, dict[str, float], dict]:
     state = torch.load(path, map_location=device)
     model.load_state_dict(state["model"])
     if "ema_model" in state:
@@ -212,7 +282,8 @@ def load_checkpoint(path, model, optimizer, ema: EMA, device: torch.device) -> t
     best_metric = float(state.get("best_metric", float("inf")))
     saved_best_metrics = state.get("best_metrics", {})
     best_metrics = {str(key): float(value) for key, value in saved_best_metrics.items()}
-    return start_step, best_metric, best_metrics
+    training_state = dict(state.get("training_state", {}))
+    return start_step, best_metric, best_metrics, training_state
 
 
 def main() -> None:
@@ -263,6 +334,7 @@ def main() -> None:
         res_blocks=cfg["model"]["res_blocks"],
         dropout=cfg["model"].get("dropout", 0.0),
         beta_schedule=cfg["diffusion"]["beta_schedule"],
+        num_side_classes=getattr(train_dataset, "num_side_classes", None),
     ).to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -286,32 +358,53 @@ def main() -> None:
         "val_mae": float("inf"),
         "val_ssim": float("-inf"),
     }
+    early_stop_cfg = cfg["train"].get("early_stop", {})
+    early_stop_enabled = bool(early_stop_cfg.get("enabled", False))
+    early_stop_patience = int(early_stop_cfg.get("patience_validations", 20))
+    early_stop_min_delta = float(early_stop_cfg.get("min_delta", 0.0))
+    early_stop_best_score = float("-inf")
+    early_stop_bad_validations = 0
     start_step = 0
 
     resume_path = args.resume or cfg["train"].get("resume_checkpoint")
     if resume_path:
-        start_step, best_metric, loaded_best_metrics = load_checkpoint(resume_path, model, optimizer, ema, device)
+        start_step, best_metric, loaded_best_metrics, training_state = load_checkpoint(resume_path, model, optimizer, ema, device)
         best_metrics.update(loaded_best_metrics)
+        early_stop_best_score = float(training_state.get("early_stop_best_score", early_stop_best_score))
+        early_stop_bad_validations = int(training_state.get("early_stop_bad_validations", early_stop_bad_validations))
         print(
             {
                 "resumed_from": resume_path,
                 "start_step": start_step,
                 "best_metric": best_metric,
                 "best_metrics": best_metrics,
+                "early_stop_best_score": early_stop_best_score,
+                "early_stop_bad_validations": early_stop_bad_validations,
             }
         )
 
     train_iter = cycle(train_loader)
-    progress = tqdm(range(start_step + 1, max_steps + 1), desc="train steps", leave=True, initial=start_step, total=max_steps)
+    progress = tqdm(
+        range(start_step + 1, max_steps + 1),
+        desc="train steps",
+        leave=True,
+        initial=start_step,
+        total=max_steps,
+        dynamic_ncols=True,
+        mininterval=1.0,
+    )
     recent_losses: list[float] = []
 
     for step in progress:
+        current_lr = resolve_step_lr(cfg["train"], step)
+        set_optimizer_lr(optimizer, current_lr)
         batch = next(train_iter)
         model.train()
         condition = batch["condition"].to(device)
         target = batch["target"].to(device)
+        side_labels = get_batch_side_labels(batch, device)
         optimizer.zero_grad(set_to_none=True)
-        loss = model(target, condition)
+        loss = model(target, condition, side_labels=side_labels)
         loss.backward()
         optimizer.step()
         if step >= ema_start:
@@ -324,7 +417,7 @@ def main() -> None:
         progress.set_postfix(loss=f"{loss_value:.6f}", avg=f"{sum(recent_losses)/len(recent_losses):.6f}")
 
         if run is not None and step % log_every == 0:
-            run.log({"step": step, "train_loss": sum(recent_losses) / len(recent_losses)})
+            run.log({"step": step, "train_loss": sum(recent_losses) / len(recent_losses), "lr": get_optimizer_lr(optimizer)})
 
         if step % validate_every == 0 or step == max_steps:
             eval_model = ema.ema_model
@@ -336,6 +429,7 @@ def main() -> None:
                 max_batches=cfg["validation"].get("max_batches"),
                 compute_fid=(fid_every > 0 and step % fid_every == 0),
             )
+            val_metrics["lr"] = get_optimizer_lr(optimizer)
             val_metrics["step"] = step
             print(val_metrics)
             if run is not None:
@@ -353,6 +447,10 @@ def main() -> None:
                     cfg,
                     best_metric=current_mae,
                     best_metrics=best_metrics,
+                    training_state={
+                        "early_stop_best_score": early_stop_best_score,
+                        "early_stop_bad_validations": early_stop_bad_validations,
+                    },
                 )
 
             current_ssim = float(val_metrics["val_ssim"])
@@ -367,6 +465,10 @@ def main() -> None:
                     cfg,
                     best_metric=current_ssim,
                     best_metrics=best_metrics,
+                    training_state={
+                        "early_stop_best_score": early_stop_best_score,
+                        "early_stop_bad_validations": early_stop_bad_validations,
+                    },
                 )
 
             metric_value = float(val_metrics.get(best_metric_name, val_metrics["val_mae"]))
@@ -381,11 +483,42 @@ def main() -> None:
                     cfg,
                     best_metric=best_metric,
                     best_metrics=best_metrics,
+                    training_state={
+                        "early_stop_best_score": early_stop_best_score,
+                        "early_stop_bad_validations": early_stop_bad_validations,
+                    },
                 )
+
+            if early_stop_enabled:
+                current_score = compute_early_stop_score(val_metrics, early_stop_cfg)
+                val_metrics["early_stop_score"] = current_score
+                if current_score > early_stop_best_score + early_stop_min_delta:
+                    early_stop_best_score = current_score
+                    early_stop_bad_validations = 0
+                else:
+                    early_stop_bad_validations += 1
+                print(
+                    {
+                        "early_stop_score": current_score,
+                        "early_stop_best_score": early_stop_best_score,
+                        "early_stop_bad_validations": early_stop_bad_validations,
+                        "early_stop_patience": early_stop_patience,
+                    }
+                )
+                if run is not None:
+                    run.log(
+                        {
+                            "step": step,
+                            "early_stop_score": current_score,
+                            "early_stop_best_score": early_stop_best_score,
+                            "early_stop_bad_validations": early_stop_bad_validations,
+                        }
+                    )
 
             preview_batch = next(iter(val_loader))
             preview_condition = preview_batch["condition"].to(device)
-            preview_pred = run_sampler(eval_model, preview_condition, cfg["validation"]["sampler"])
+            preview_side_labels = get_batch_side_labels(preview_batch, device)
+            preview_pred = run_sampler(eval_model, preview_condition, cfg["validation"]["sampler"], side_labels=preview_side_labels)
             preview_name = str(preview_batch["name"][0])
             save_tensor_npy(preview_pred[0], sample_dir / f"step_{step:06d}_{preview_name}_pred.npy")
             for channel_idx in range(preview_pred.shape[1]):
@@ -401,6 +534,10 @@ def main() -> None:
                 cfg,
                 best_metric=best_metric,
                 best_metrics=best_metrics,
+                training_state={
+                    "early_stop_best_score": early_stop_best_score,
+                    "early_stop_bad_validations": early_stop_bad_validations,
+                },
             )
             save_checkpoint(
                 checkpoint_dir / "last.pt",
@@ -411,7 +548,22 @@ def main() -> None:
                 cfg,
                 best_metric=best_metric,
                 best_metrics=best_metrics,
+                training_state={
+                    "early_stop_best_score": early_stop_best_score,
+                    "early_stop_bad_validations": early_stop_bad_validations,
+                },
             )
+
+        if early_stop_enabled and early_stop_bad_validations >= early_stop_patience:
+            print(
+                {
+                    "early_stop_triggered": True,
+                    "step": step,
+                    "early_stop_best_score": early_stop_best_score,
+                    "early_stop_bad_validations": early_stop_bad_validations,
+                }
+            )
+            break
 
     if run is not None:
         run.finish()
