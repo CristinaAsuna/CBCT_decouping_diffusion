@@ -127,6 +127,12 @@ def run_sampler(model: GaussianConditionalDiffusion, condition: torch.Tensor, sa
     raise ValueError(f"Unsupported sampler: {sampler}")
 
 
+def is_better_metric(metric_name: str, current: float, best: float) -> bool:
+    if metric_name in {"val_ssim", "psnr", "val_psnr"}:
+        return current > best
+    return current < best
+
+
 @torch.no_grad()
 def validate(model, loader, device, sample_cfg: dict, max_batches: int | None = None, compute_fid: bool = False) -> dict[str, float]:
     model.eval()
@@ -172,7 +178,16 @@ def validate(model, loader, device, sample_cfg: dict, max_batches: int | None = 
     return metrics
 
 
-def save_checkpoint(path, model, optimizer, ema: EMA, step: int, cfg: dict, best_metric: float | None = None) -> None:
+def save_checkpoint(
+    path,
+    model,
+    optimizer,
+    ema: EMA,
+    step: int,
+    cfg: dict,
+    best_metric: float | None = None,
+    best_metrics: dict[str, float] | None = None,
+) -> None:
     torch.save(
         {
             "model": model.state_dict(),
@@ -181,12 +196,13 @@ def save_checkpoint(path, model, optimizer, ema: EMA, step: int, cfg: dict, best
             "config": cfg,
             "step": step,
             "best_metric": best_metric,
+            "best_metrics": best_metrics or {},
         },
         path,
     )
 
 
-def load_checkpoint(path, model, optimizer, ema: EMA, device: torch.device) -> tuple[int, float]:
+def load_checkpoint(path, model, optimizer, ema: EMA, device: torch.device) -> tuple[int, float, dict[str, float]]:
     state = torch.load(path, map_location=device)
     model.load_state_dict(state["model"])
     if "ema_model" in state:
@@ -194,7 +210,9 @@ def load_checkpoint(path, model, optimizer, ema: EMA, device: torch.device) -> t
     optimizer.load_state_dict(state["optimizer"])
     start_step = int(state.get("step", 0))
     best_metric = float(state.get("best_metric", float("inf")))
-    return start_step, best_metric
+    saved_best_metrics = state.get("best_metrics", {})
+    best_metrics = {str(key): float(value) for key, value in saved_best_metrics.items()}
+    return start_step, best_metric, best_metrics
 
 
 def main() -> None:
@@ -262,14 +280,26 @@ def main() -> None:
     log_every = int(cfg["train"].get("log_every_steps", 50))
     ema_start = int(cfg["train"].get("ema_start_step", 0))
     fid_every = int(cfg["validation"].get("fid_every_steps", validate_every))
-    best_metric = float("inf")
     best_metric_name = cfg["train"].get("best_metric", "val_mae")
+    best_metric = float("-inf") if best_metric_name in {"val_ssim", "psnr", "val_psnr"} else float("inf")
+    best_metrics = {
+        "val_mae": float("inf"),
+        "val_ssim": float("-inf"),
+    }
     start_step = 0
 
     resume_path = args.resume or cfg["train"].get("resume_checkpoint")
     if resume_path:
-        start_step, best_metric = load_checkpoint(resume_path, model, optimizer, ema, device)
-        print({"resumed_from": resume_path, "start_step": start_step, "best_metric": best_metric})
+        start_step, best_metric, loaded_best_metrics = load_checkpoint(resume_path, model, optimizer, ema, device)
+        best_metrics.update(loaded_best_metrics)
+        print(
+            {
+                "resumed_from": resume_path,
+                "start_step": start_step,
+                "best_metric": best_metric,
+                "best_metrics": best_metrics,
+            }
+        )
 
     train_iter = cycle(train_loader)
     progress = tqdm(range(start_step + 1, max_steps + 1), desc="train steps", leave=True, initial=start_step, total=max_steps)
@@ -311,10 +341,47 @@ def main() -> None:
             if run is not None:
                 run.log(val_metrics)
 
+            current_mae = float(val_metrics["val_mae"])
+            if current_mae < best_metrics["val_mae"]:
+                best_metrics["val_mae"] = current_mae
+                save_checkpoint(
+                    checkpoint_dir / "best_ema_mae.pt",
+                    model,
+                    optimizer,
+                    ema,
+                    step,
+                    cfg,
+                    best_metric=current_mae,
+                    best_metrics=best_metrics,
+                )
+
+            current_ssim = float(val_metrics["val_ssim"])
+            if current_ssim > best_metrics["val_ssim"]:
+                best_metrics["val_ssim"] = current_ssim
+                save_checkpoint(
+                    checkpoint_dir / "best_ema_ssim.pt",
+                    model,
+                    optimizer,
+                    ema,
+                    step,
+                    cfg,
+                    best_metric=current_ssim,
+                    best_metrics=best_metrics,
+                )
+
             metric_value = float(val_metrics.get(best_metric_name, val_metrics["val_mae"]))
-            if metric_value < best_metric:
+            if is_better_metric(best_metric_name, metric_value, best_metric):
                 best_metric = metric_value
-                save_checkpoint(checkpoint_dir / "best_ema.pt", model, optimizer, ema, step, cfg, best_metric=best_metric)
+                save_checkpoint(
+                    checkpoint_dir / "best_ema.pt",
+                    model,
+                    optimizer,
+                    ema,
+                    step,
+                    cfg,
+                    best_metric=best_metric,
+                    best_metrics=best_metrics,
+                )
 
             preview_batch = next(iter(val_loader))
             preview_condition = preview_batch["condition"].to(device)
@@ -325,8 +392,26 @@ def main() -> None:
                 save_tensor_png(preview_pred[0, channel_idx : channel_idx + 1], sample_dir / f"step_{step:06d}_{preview_name}_ch{channel_idx}.png")
 
         if step % save_every == 0 or step == max_steps:
-            save_checkpoint(checkpoint_dir / f"step_{step:06d}.pt", model, optimizer, ema, step, cfg, best_metric=best_metric)
-            save_checkpoint(checkpoint_dir / "last.pt", model, optimizer, ema, step, cfg, best_metric=best_metric)
+            save_checkpoint(
+                checkpoint_dir / f"step_{step:06d}.pt",
+                model,
+                optimizer,
+                ema,
+                step,
+                cfg,
+                best_metric=best_metric,
+                best_metrics=best_metrics,
+            )
+            save_checkpoint(
+                checkpoint_dir / "last.pt",
+                model,
+                optimizer,
+                ema,
+                step,
+                cfg,
+                best_metric=best_metric,
+                best_metrics=best_metrics,
+            )
 
     if run is not None:
         run.finish()

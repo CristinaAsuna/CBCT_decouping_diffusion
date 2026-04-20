@@ -6,9 +6,14 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .config import load_config
-from .dataset import CaseFolderNpyDataset, NpyConditionTargetDataset
-from .metrics import compute_channelwise_fid, mae, mse, psnr, ssim
+try:
+    from .config import load_config
+    from .dataset import CaseFolderNpyDataset, NpyConditionTargetDataset
+    from .metrics import compute_channelwise_fid, mae, mse, psnr, ssim
+except ImportError:
+    from config import load_config
+    from dataset import CaseFolderNpyDataset, NpyConditionTargetDataset
+    from metrics import compute_channelwise_fid, mae, mse, psnr, ssim
 
 
 def build_dataset(dataset_cfg: dict):
@@ -49,11 +54,15 @@ def main() -> None:
     parser.add_argument("--config", required=True)
     parser.add_argument("--pred-dir", required=True)
     parser.add_argument("--split", default="val", choices=["train", "val", "test"])
+    parser.add_argument("--case-root", default=None, help="Optional override for dataset.case_root")
     parser.add_argument("--with-fid", action="store_true")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    dataset = build_dataset(cfg["dataset"][args.split])
+    dataset_cfg = dict(cfg["dataset"][args.split])
+    if args.case_root is not None:
+        dataset_cfg["case_root"] = args.case_root
+    dataset = build_dataset(dataset_cfg)
     pred_dir = Path(args.pred_dir)
     preds = []
     targets = []

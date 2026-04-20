@@ -62,11 +62,11 @@ train:
   best_metric: "val_mae"
 
 validation:
-  max_batches: 10
+  max_batches: 16
   fid_every_steps: 0
   sampler:
     sampler: "ddim"
-    steps: 50
+    steps: 100
     eta: 0.0
 
 logging:

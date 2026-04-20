@@ -7,7 +7,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from .models import UNet
+try:
+    from .models import UNet
+except ImportError:
+    from models import UNet
 
 
 def extract(a: torch.Tensor, t: torch.Tensor, x_shape=(1, 1, 1, 1)) -> torch.Tensor:
@@ -119,19 +122,34 @@ class GaussianConditionalDiffusion(nn.Module):
 
     @torch.no_grad()
     def sample_ddim(self, condition: torch.Tensor, sample_steps: int = 50, eta: float = 0.0) -> torch.Tensor:
+        return self.sample_ddim_trace(condition, sample_steps=sample_steps, eta=eta)["final"]
+
+    @torch.no_grad()
+    def sample_ddim_trace(
+        self,
+        condition: torch.Tensor,
+        sample_steps: int = 50,
+        eta: float = 0.0,
+    ) -> dict[str, torch.Tensor | list[torch.Tensor] | list[int]]:
         if sample_steps <= 0:
             raise ValueError("sample_steps must be positive")
         batch = condition.shape[0]
         y_t = torch.randn(batch, self.target_channels, condition.shape[2], condition.shape[3], device=condition.device)
         time_pairs = torch.linspace(self.num_timesteps - 1, 0, sample_steps, device=condition.device).long()
         prev_pairs = torch.cat([time_pairs[1:], torch.tensor([-1], device=condition.device, dtype=torch.long)])
+        samples: list[torch.Tensor] = [y_t.detach().cpu().clone()]
+        predictions: list[torch.Tensor] = []
+        timesteps: list[int] = [int(time_pairs[0].item())]
         for t_now, t_prev in zip(time_pairs, prev_pairs):
             t = torch.full((batch,), int(t_now.item()), device=condition.device, dtype=torch.long)
             noise_level = extract(self.gammas, t, x_shape=(1, 1)).to(y_t.device)
             noise_hat = self.denoise_fn(torch.cat([condition, y_t], dim=1), noise_level)
             y_0_hat = self.predict_start_from_noise(y_t, t=t, noise=noise_hat).clamp(-1.0, 1.0)
+            predictions.append(y_0_hat.detach().cpu().clone())
             if int(t_prev.item()) < 0:
                 y_t = y_0_hat
+                samples.append(y_t.detach().cpu().clone())
+                timesteps.append(-1)
                 continue
             t_prev_tensor = torch.full((batch,), int(t_prev.item()), device=condition.device, dtype=torch.long)
             alpha_t = extract(self.gammas, t, y_t.shape)
@@ -141,7 +159,14 @@ class GaussianConditionalDiffusion(nn.Module):
             noise = torch.randn_like(y_t) if eta > 0 else torch.zeros_like(y_t)
             direction = torch.sqrt(torch.clamp(1 - alpha_prev - sigma**2, min=0.0)) * pred_noise
             y_t = torch.sqrt(alpha_prev) * y_0_hat + direction + sigma * noise
-        return y_t
+            samples.append(y_t.detach().cpu().clone())
+            timesteps.append(int(t_prev.item()))
+        return {
+            "final": y_t,
+            "samples": samples,
+            "predictions": predictions,
+            "timesteps": timesteps,
+        }
 
     def forward(self, target: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
         batch, *_ = target.shape
