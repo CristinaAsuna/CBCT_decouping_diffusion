@@ -1,13 +1,1265 @@
+# from __future__ import annotations
+
+# import argparse
+# import copy
+# import math
+# import os
+# from itertools import cycle
+
+# import torch
+# from torch.utils.data import DataLoader
+# from tqdm import tqdm
+
+# from .config import ensure_dir, load_config
+# from .dataset import CaseFolderNpyDataset, NpyConditionTargetDataset
+# from .diffusion import GaussianConditionalDiffusion
+# from .metrics import compute_channelwise_fid, mae, mse, psnr, ssim
+# from .utils import pick_device, save_tensor_npy, save_tensor_png, set_seed
+
+
+# def build_dataset(dataset_cfg: dict):
+#     dataset_type = dataset_cfg.get("type", "paired_dirs")
+#     common_kwargs = {
+#         "image_size": dataset_cfg.get("image_size"),
+#         "normalize": dataset_cfg.get("normalize", "range_m11"),
+#         "value_range": dataset_cfg.get("value_range"),
+#         "clip_range": dataset_cfg.get("clip_range"),
+#         "target_mode": dataset_cfg.get("target_mode"),
+#         "target_side": dataset_cfg.get("target_side"),
+#         "target_sides": dataset_cfg.get("target_sides"),
+#         "side_labels": dataset_cfg.get("side_labels"),
+#     }
+#     if dataset_type == "paired_dirs":
+#         return NpyConditionTargetDataset(
+#             condition_dir=dataset_cfg["condition_dir"],
+#             target_dirs=dataset_cfg["target_dirs"],
+#             names_file=dataset_cfg.get("names_file"),
+#             **common_kwargs,
+#         )
+#     if dataset_type == "case_folders":
+#         return CaseFolderNpyDataset(
+#             case_root=dataset_cfg["case_root"],
+#             condition_file=dataset_cfg.get("condition_file"),
+#             target_files=dataset_cfg.get("target_files"),
+#             case_names_file=dataset_cfg.get("case_names_file"),
+#             include_patterns=dataset_cfg.get("include_patterns"),
+#             variants=dataset_cfg.get("variants"),
+#             condition_template=dataset_cfg.get("condition_template"),
+#             target_templates=dataset_cfg.get("target_templates"),
+#             target_template=dataset_cfg.get("target_template"),
+#             split=dataset_cfg.get("split"),
+#             split_seed=dataset_cfg.get("split_seed", 1234),
+#             train_ratio=dataset_cfg.get("train_ratio", 0.9),
+#             **common_kwargs,
+#         )
+#     raise ValueError(f"Unsupported dataset type: {dataset_type}")
+
+
+# def build_loader(dataset_cfg: dict, batch_size: int, shuffle: bool, num_workers: int):
+#     dataset = build_dataset(dataset_cfg)
+#     loader = DataLoader(
+#         dataset,
+#         batch_size=batch_size,
+#         shuffle=shuffle,
+#         num_workers=num_workers,
+#         pin_memory=torch.cuda.is_available(),
+#         drop_last=shuffle,
+#     )
+#     return dataset, loader
+
+
+# def maybe_init_swanlab(cfg: dict):
+#     if not cfg.get("use_swanlab", False):
+#         return None
+#     try:
+#         import swanlab
+#     except ImportError:
+#         print("swanlab is not installed, training will continue without it.")
+#         return None
+#     run_id = os.environ.get("SWANLAB_RUN_ID", cfg.get("run_id"))
+#     resume = os.environ.get("SWANLAB_RESUME", cfg.get("resume"))
+#     mode = os.environ.get("SWANLAB_MODE", cfg.get("mode"))
+#     logdir = os.environ.get("SWANLAB_LOGDIR", cfg.get("logdir"))
+#     settings = {
+#         "project": cfg.get("project", "palette_decoupling"),
+#         "experiment_name": cfg.get("experiment_name"),
+#         "config": cfg,
+#     }
+#     if run_id:
+#         settings["id"] = run_id
+#     if resume is not None:
+#         settings["resume"] = resume
+#     if mode:
+#         settings["mode"] = mode
+#     if logdir:
+#         settings["logdir"] = logdir
+#     print(
+#         {
+#             "swanlab_project": settings.get("project"),
+#             "swanlab_run_id": settings.get("id"),
+#             "swanlab_resume": settings.get("resume"),
+#             "swanlab_mode": settings.get("mode"),
+#             "swanlab_logdir": settings.get("logdir"),
+#         }
+#     )
+#     return swanlab.init(**settings)
+
+
+# class EMA:
+#     def __init__(self, model: torch.nn.Module, decay: float):
+#         self.decay = decay
+#         self.ema_model = copy.deepcopy(model).eval()
+#         for parameter in self.ema_model.parameters():
+#             parameter.requires_grad_(False)
+
+#     @torch.no_grad()
+#     def update(self, model: torch.nn.Module) -> None:
+#         ema_state = self.ema_model.state_dict()
+#         model_state = model.state_dict()
+#         for key, value in ema_state.items():
+#             if not torch.is_floating_point(value):
+#                 value.copy_(model_state[key])
+#             else:
+#                 value.mul_(self.decay).add_(model_state[key], alpha=1.0 - self.decay)
+
+
+# def run_sampler(
+#     model: GaussianConditionalDiffusion,
+#     condition: torch.Tensor,
+#     sample_cfg: dict,
+#     side_labels: torch.Tensor | None = None,
+# ) -> torch.Tensor:
+#     sampler = sample_cfg.get("sampler", "ddim")
+#     steps = sample_cfg.get("steps", 50)
+#     if sampler == "ddim":
+#         return model.sample_ddim(condition, sample_steps=steps, eta=sample_cfg.get("eta", 0.0), side_labels=side_labels)
+#     if sampler == "ddpm":
+#         return model.sample(condition, sample_steps=steps, side_labels=side_labels)
+#     raise ValueError(f"Unsupported sampler: {sampler}")
+
+
+# def is_better_metric(metric_name: str, current: float, best: float) -> bool:
+#     if metric_name in {"val_ssim", "psnr", "val_psnr"}:
+#         return current > best
+#     return current < best
+
+
+# def resolve_step_lr(train_cfg: dict, step: int) -> float:
+#     base_lr = float(train_cfg["lr"])
+#     schedule_cfg = train_cfg.get("lr_schedule", {})
+#     if not schedule_cfg or not schedule_cfg.get("enabled", False):
+#         return base_lr
+#     schedule_type = schedule_cfg.get("type", "step")
+#     if schedule_type == "step":
+#         current_lr = base_lr
+#         schedule_steps = schedule_cfg.get("steps", [])
+#         for item in sorted(schedule_steps, key=lambda entry: int(entry["step"])):
+#             if step >= int(item["step"]):
+#                 current_lr = float(item["lr"])
+#             else:
+#                 break
+#         return current_lr
+#     if schedule_type in {"cosine", "cosine_with_warmup"}:
+#         max_steps = int(train_cfg["max_steps"])
+#         warmup_steps = int(schedule_cfg.get("warmup_steps", 0))
+#         warmup_start_lr = float(schedule_cfg.get("warmup_start_lr", 0.0))
+#         min_lr = float(schedule_cfg.get("min_lr", 0.0))
+#         if warmup_steps > 0 and step <= warmup_steps:
+#             warmup_progress = step / max(warmup_steps, 1)
+#             return warmup_start_lr + warmup_progress * (base_lr - warmup_start_lr)
+#         cosine_total = max(1, max_steps - warmup_steps)
+#         cosine_progress = min(max((step - warmup_steps) / cosine_total, 0.0), 1.0)
+#         cosine_decay = 0.5 * (1.0 + math.cos(math.pi * cosine_progress))
+#         return min_lr + (base_lr - min_lr) * cosine_decay
+#     current_lr = base_lr
+#     raise ValueError(f"Unsupported lr_schedule type: {schedule_type}")
+
+
+# def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
+#     for param_group in optimizer.param_groups:
+#         param_group["lr"] = lr
+
+
+# def get_optimizer_lr(optimizer: torch.optim.Optimizer) -> float:
+#     return float(optimizer.param_groups[0]["lr"])
+
+
+# def compute_early_stop_score(val_metrics: dict[str, float], early_stop_cfg: dict) -> float:
+#     score_cfg = early_stop_cfg.get("score", {})
+#     mae_weight = float(score_cfg.get("mae_weight", 1.0))
+#     ssim_weight = float(score_cfg.get("ssim_weight", 1.0))
+#     return ssim_weight * float(val_metrics["val_ssim"]) - mae_weight * float(val_metrics["val_mae"])
+
+
+# def get_batch_side_labels(batch: dict, device: torch.device) -> torch.Tensor | None:
+#     side = batch.get("side")
+#     if side is None:
+#         return None
+#     if not isinstance(side, torch.Tensor):
+#         raise TypeError("batch['side'] must be a torch.Tensor")
+#     return side.to(device=device, dtype=torch.long)
+
+
+# @torch.no_grad()
+# def validate(model, loader, device, sample_cfg: dict, max_batches: int | None = None, compute_fid: bool = False) -> dict[str, float]:
+#     model.eval()
+#     losses: list[float] = []
+#     maes: list[float] = []
+#     mses: list[float] = []
+#     psnrs: list[float] = []
+#     ssims: list[float] = []
+#     fid_preds = []
+#     fid_targets = []
+#     progress_total = min(len(loader), max_batches) if max_batches is not None else len(loader)
+#     for batch_idx, batch in enumerate(tqdm(loader, desc="validate", leave=False, total=progress_total)):
+#         if max_batches is not None and batch_idx >= max_batches:
+#             break
+#         condition = batch["condition"].to(device)
+#         target = batch["target"].to(device)
+#         side_labels = get_batch_side_labels(batch, device)
+#         loss = model(target, condition, side_labels=side_labels)
+#         pred = run_sampler(model, condition, sample_cfg, side_labels=side_labels)
+#         losses.append(float(loss.item()))
+#         maes.append(mae(pred, target))
+#         mses.append(mse(pred, target))
+#         psnrs.append(psnr(pred, target))
+#         ssims.append(ssim(pred, target))
+#         if compute_fid:
+#             fid_preds.append(pred.detach().cpu())
+#             fid_targets.append(target.detach().cpu())
+
+#     metrics = {
+#         "val_loss": sum(losses) / max(len(losses), 1),
+#         "val_mae": sum(maes) / max(len(maes), 1),
+#         "val_mse": sum(mses) / max(len(mses), 1),
+#         "val_psnr": sum(psnrs) / max(len(psnrs), 1),
+#         "val_ssim": sum(ssims) / max(len(ssims), 1),
+#     }
+#     if compute_fid and fid_preds:
+#         pred_tensor = torch.cat(fid_preds, dim=0)
+#         target_tensor = torch.cat(fid_targets, dim=0)
+#         try:
+#             fid_per_channel = compute_channelwise_fid(pred_tensor, target_tensor)
+#             metrics["fid_mean"] = float(sum(fid_per_channel) / len(fid_per_channel))
+#         except Exception as exc:
+#             print(f"Skipping FID due to error: {exc}")
+#     return metrics
+
+
+# def save_checkpoint(
+#     path,
+#     model,
+#     optimizer,
+#     ema: EMA,
+#     step: int,
+#     cfg: dict,
+#     best_metric: float | None = None,
+#     best_metrics: dict[str, float] | None = None,
+#     training_state: dict | None = None,
+# ) -> None:
+#     torch.save(
+#         {
+#             "model": model.state_dict(),
+#             "ema_model": ema.ema_model.state_dict(),
+#             "optimizer": optimizer.state_dict(),
+#             "config": cfg,
+#             "step": step,
+#             "best_metric": best_metric,
+#             "best_metrics": best_metrics or {},
+#             "training_state": training_state or {},
+#         },
+#         path,
+#     )
+
+
+# def load_checkpoint(path, model, optimizer, ema: EMA, device: torch.device) -> tuple[int, float, dict[str, float], dict]:
+#     state = torch.load(path, map_location=device)
+#     model.load_state_dict(state["model"])
+#     if "ema_model" in state:
+#         ema.ema_model.load_state_dict(state["ema_model"])
+#     optimizer.load_state_dict(state["optimizer"])
+#     start_step = int(state.get("step", 0))
+#     best_metric = float(state.get("best_metric", float("inf")))
+#     saved_best_metrics = state.get("best_metrics", {})
+#     best_metrics = {str(key): float(value) for key, value in saved_best_metrics.items()}
+#     training_state = dict(state.get("training_state", {}))
+#     return start_step, best_metric, best_metrics, training_state
+
+
+# def main() -> None:
+#     parser = argparse.ArgumentParser(description="Research-style step-based trainer for palette_decoupling.")
+#     parser.add_argument("--config", required=True, help="Path to yaml/json config.")
+#     parser.add_argument("--resume", default=None, help="Optional checkpoint path to resume from.")
+#     args = parser.parse_args()
+
+#     cfg = load_config(args.config)
+#     set_seed(int(cfg.get("seed", 1234)))
+#     device = pick_device(cfg.get("device"))
+
+#     output_dir = ensure_dir(cfg["output"]["root"])
+#     checkpoint_dir = ensure_dir(output_dir / "checkpoints")
+#     sample_dir = ensure_dir(output_dir / "samples")
+
+#     train_dataset, train_loader = build_loader(
+#         cfg["dataset"]["train"],
+#         batch_size=cfg["train"]["batch_size"],
+#         shuffle=True,
+#         num_workers=cfg["train"].get("num_workers", 0),
+#     )
+#     val_dataset, val_loader = build_loader(
+#         cfg["dataset"]["val"],
+#         batch_size=cfg["train"].get("val_batch_size", cfg["train"]["batch_size"]),
+#         shuffle=False,
+#         num_workers=cfg["train"].get("num_workers", 0),
+#     )
+
+#     print(
+#         {
+#             "device": str(device),
+#             "train_samples": len(train_dataset),
+#             "val_samples": len(val_dataset),
+#             "condition_channels": train_dataset.condition_channels,
+#             "target_channels": train_dataset.target_channels,
+#         }
+#     )
+
+#     image_size = cfg["model"].get("image_size") or train_dataset[0]["condition"].shape[-1]
+#     model = GaussianConditionalDiffusion(
+#         condition_channels=train_dataset.condition_channels,
+#         target_channels=train_dataset.target_channels,
+#         image_size=image_size,
+#         inner_channel=cfg["model"]["inner_channel"],
+#         channel_mults=cfg["model"]["channel_mults"],
+#         attn_res=cfg["model"]["attn_res"],
+#         res_blocks=cfg["model"]["res_blocks"],
+#         dropout=cfg["model"].get("dropout", 0.0),
+#         beta_schedule=cfg["diffusion"]["beta_schedule"],
+#         num_side_classes=getattr(train_dataset, "num_side_classes", None),
+#     ).to(device)
+#     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+#     optimizer = torch.optim.AdamW(
+#         model.parameters(),
+#         lr=cfg["train"]["lr"],
+#         weight_decay=cfg["train"].get("weight_decay", 0.0),
+#     )
+#     ema = EMA(model, decay=cfg["train"].get("ema_decay", 0.9999))
+#     run = maybe_init_swanlab(cfg.get("logging", {}))
+
+#     max_steps = int(cfg["train"]["max_steps"])
+#     validate_every = int(cfg["train"]["validate_every_steps"])
+#     save_every = int(cfg["train"].get("save_every_steps", validate_every))
+#     log_every = int(cfg["train"].get("log_every_steps", 50))
+#     ema_start = int(cfg["train"].get("ema_start_step", 0))
+#     fid_every = int(cfg["validation"].get("fid_every_steps", validate_every))
+#     best_metric_name = cfg["train"].get("best_metric", "val_mae")
+#     best_metric = float("-inf") if best_metric_name in {"val_ssim", "psnr", "val_psnr"} else float("inf")
+#     best_metrics = {
+#         "val_mae": float("inf"),
+#         "val_ssim": float("-inf"),
+#     }
+#     early_stop_cfg = cfg["train"].get("early_stop", {})
+#     early_stop_enabled = bool(early_stop_cfg.get("enabled", False))
+#     early_stop_patience = int(early_stop_cfg.get("patience_validations", 20))
+#     early_stop_min_delta = float(early_stop_cfg.get("min_delta", 0.0))
+#     early_stop_best_score = float("-inf")
+#     early_stop_bad_validations = 0
+#     start_step = 0
+
+#     resume_path = args.resume or cfg["train"].get("resume_checkpoint")
+#     if resume_path:
+#         start_step, best_metric, loaded_best_metrics, training_state = load_checkpoint(resume_path, model, optimizer, ema, device)
+#         best_metrics.update(loaded_best_metrics)
+#         early_stop_best_score = float(training_state.get("early_stop_best_score", early_stop_best_score))
+#         early_stop_bad_validations = int(training_state.get("early_stop_bad_validations", early_stop_bad_validations))
+#         print(
+#             {
+#                 "resumed_from": resume_path,
+#                 "start_step": start_step,
+#                 "best_metric": best_metric,
+#                 "best_metrics": best_metrics,
+#                 "early_stop_best_score": early_stop_best_score,
+#                 "early_stop_bad_validations": early_stop_bad_validations,
+#             }
+#         )
+
+#     train_iter = cycle(train_loader)
+#     progress = tqdm(
+#         range(start_step + 1, max_steps + 1),
+#         desc="train steps",
+#         leave=True,
+#         initial=start_step,
+#         total=max_steps,
+#         dynamic_ncols=True,
+#         mininterval=1.0,
+#     )
+#     recent_losses: list[float] = []
+
+#     for step in progress:
+#         current_lr = resolve_step_lr(cfg["train"], step)
+#         set_optimizer_lr(optimizer, current_lr)
+#         batch = next(train_iter)
+#         model.train()
+#         condition = batch["condition"].to(device)
+#         target = batch["target"].to(device)
+#         side_labels = get_batch_side_labels(batch, device)
+#         optimizer.zero_grad(set_to_none=True)
+#         loss = model(target, condition, side_labels=side_labels)
+#         loss.backward()
+#         optimizer.step()
+#         if step >= ema_start:
+#             ema.update(model)
+
+#         loss_value = float(loss.item())
+#         recent_losses.append(loss_value)
+#         if len(recent_losses) > log_every:
+#             recent_losses.pop(0)
+#         progress.set_postfix(loss=f"{loss_value:.6f}", avg=f"{sum(recent_losses)/len(recent_losses):.6f}")
+
+#         if run is not None and step % log_every == 0:
+#             run.log({"step": step, "train_loss": sum(recent_losses) / len(recent_losses), "lr": get_optimizer_lr(optimizer)})
+
+#         if step % validate_every == 0 or step == max_steps:
+#             eval_model = ema.ema_model
+#             val_metrics = validate(
+#                 eval_model,
+#                 val_loader,
+#                 device,
+#                 sample_cfg=cfg["validation"]["sampler"],
+#                 max_batches=cfg["validation"].get("max_batches"),
+#                 compute_fid=(fid_every > 0 and step % fid_every == 0),
+#             )
+#             val_metrics["lr"] = get_optimizer_lr(optimizer)
+#             val_metrics["step"] = step
+#             print(val_metrics)
+#             if run is not None:
+#                 run.log(val_metrics)
+
+#             current_mae = float(val_metrics["val_mae"])
+#             if current_mae < best_metrics["val_mae"]:
+#                 best_metrics["val_mae"] = current_mae
+#                 save_checkpoint(
+#                     checkpoint_dir / "best_ema_mae.pt",
+#                     model,
+#                     optimizer,
+#                     ema,
+#                     step,
+#                     cfg,
+#                     best_metric=current_mae,
+#                     best_metrics=best_metrics,
+#                     training_state={
+#                         "early_stop_best_score": early_stop_best_score,
+#                         "early_stop_bad_validations": early_stop_bad_validations,
+#                     },
+#                 )
+
+#             current_ssim = float(val_metrics["val_ssim"])
+#             if current_ssim > best_metrics["val_ssim"]:
+#                 best_metrics["val_ssim"] = current_ssim
+#                 save_checkpoint(
+#                     checkpoint_dir / "best_ema_ssim.pt",
+#                     model,
+#                     optimizer,
+#                     ema,
+#                     step,
+#                     cfg,
+#                     best_metric=current_ssim,
+#                     best_metrics=best_metrics,
+#                     training_state={
+#                         "early_stop_best_score": early_stop_best_score,
+#                         "early_stop_bad_validations": early_stop_bad_validations,
+#                     },
+#                 )
+
+#             metric_value = float(val_metrics.get(best_metric_name, val_metrics["val_mae"]))
+#             if is_better_metric(best_metric_name, metric_value, best_metric):
+#                 best_metric = metric_value
+#                 save_checkpoint(
+#                     checkpoint_dir / "best_ema.pt",
+#                     model,
+#                     optimizer,
+#                     ema,
+#                     step,
+#                     cfg,
+#                     best_metric=best_metric,
+#                     best_metrics=best_metrics,
+#                     training_state={
+#                         "early_stop_best_score": early_stop_best_score,
+#                         "early_stop_bad_validations": early_stop_bad_validations,
+#                     },
+#                 )
+
+#             if early_stop_enabled:
+#                 current_score = compute_early_stop_score(val_metrics, early_stop_cfg)
+#                 val_metrics["early_stop_score"] = current_score
+#                 if current_score > early_stop_best_score + early_stop_min_delta:
+#                     early_stop_best_score = current_score
+#                     early_stop_bad_validations = 0
+#                 else:
+#                     early_stop_bad_validations += 1
+#                 print(
+#                     {
+#                         "early_stop_score": current_score,
+#                         "early_stop_best_score": early_stop_best_score,
+#                         "early_stop_bad_validations": early_stop_bad_validations,
+#                         "early_stop_patience": early_stop_patience,
+#                     }
+#                 )
+#                 if run is not None:
+#                     run.log(
+#                         {
+#                             "step": step,
+#                             "early_stop_score": current_score,
+#                             "early_stop_best_score": early_stop_best_score,
+#                             "early_stop_bad_validations": early_stop_bad_validations,
+#                         }
+#                     )
+
+#             preview_batch = next(iter(val_loader))
+#             preview_condition = preview_batch["condition"].to(device)
+#             preview_side_labels = get_batch_side_labels(preview_batch, device)
+#             preview_pred = run_sampler(eval_model, preview_condition, cfg["validation"]["sampler"], side_labels=preview_side_labels)
+#             preview_name = str(preview_batch["name"][0])
+#             save_tensor_npy(preview_pred[0], sample_dir / f"step_{step:06d}_{preview_name}_pred.npy")
+#             for channel_idx in range(preview_pred.shape[1]):
+#                 save_tensor_png(preview_pred[0, channel_idx : channel_idx + 1], sample_dir / f"step_{step:06d}_{preview_name}_ch{channel_idx}.png")
+
+#         if step % save_every == 0 or step == max_steps:
+#             save_checkpoint(
+#                 checkpoint_dir / f"step_{step:06d}.pt",
+#                 model,
+#                 optimizer,
+#                 ema,
+#                 step,
+#                 cfg,
+#                 best_metric=best_metric,
+#                 best_metrics=best_metrics,
+#                 training_state={
+#                     "early_stop_best_score": early_stop_best_score,
+#                     "early_stop_bad_validations": early_stop_bad_validations,
+#                 },
+#             )
+#             save_checkpoint(
+#                 checkpoint_dir / "last.pt",
+#                 model,
+#                 optimizer,
+#                 ema,
+#                 step,
+#                 cfg,
+#                 best_metric=best_metric,
+#                 best_metrics=best_metrics,
+#                 training_state={
+#                     "early_stop_best_score": early_stop_best_score,
+#                     "early_stop_bad_validations": early_stop_bad_validations,
+#                 },
+#             )
+
+#         if early_stop_enabled and early_stop_bad_validations >= early_stop_patience:
+#             print(
+#                 {
+#                     "early_stop_triggered": True,
+#                     "step": step,
+#                     "early_stop_best_score": early_stop_best_score,
+#                     "early_stop_bad_validations": early_stop_bad_validations,
+#                 }
+#             )
+#             break
+
+#     if run is not None:
+#         run.finish()
+
+
+# if __name__ == "__main__":
+#     main()
+# from __future__ import annotations
+
+# import argparse
+# import copy
+# import math
+# import os
+
+# import torch
+# import torch.distributed as dist
+# from torch.nn.parallel import DistributedDataParallel as DDP
+# from torch.utils.data import DataLoader
+# from torch.utils.data.distributed import DistributedSampler
+# from tqdm import tqdm
+
+# from .config import ensure_dir, load_config
+# from .dataset import CaseFolderNpyDataset, NpyConditionTargetDataset
+# from .diffusion import GaussianConditionalDiffusion
+# from .metrics import compute_channelwise_fid, mae, mse, psnr, ssim
+# from .utils import pick_device, save_tensor_npy, save_tensor_png, set_seed
+
+
+# def build_dataset(dataset_cfg: dict):
+#     dataset_type = dataset_cfg.get("type", "paired_dirs")
+#     common_kwargs = {
+#         "image_size": dataset_cfg.get("image_size"),
+#         "normalize": dataset_cfg.get("normalize", "range_m11"),
+#         "value_range": dataset_cfg.get("value_range"),
+#         "clip_range": dataset_cfg.get("clip_range"),
+#         "target_mode": dataset_cfg.get("target_mode"),
+#         "target_side": dataset_cfg.get("target_side"),
+#         "target_sides": dataset_cfg.get("target_sides"),
+#         "side_labels": dataset_cfg.get("side_labels"),
+#     }
+#     if dataset_type == "paired_dirs":
+#         return NpyConditionTargetDataset(
+#             condition_dir=dataset_cfg["condition_dir"],
+#             target_dirs=dataset_cfg["target_dirs"],
+#             names_file=dataset_cfg.get("names_file"),
+#             **common_kwargs,
+#         )
+#     if dataset_type == "case_folders":
+#         return CaseFolderNpyDataset(
+#             case_root=dataset_cfg["case_root"],
+#             condition_file=dataset_cfg.get("condition_file"),
+#             target_files=dataset_cfg.get("target_files"),
+#             case_names_file=dataset_cfg.get("case_names_file"),
+#             include_patterns=dataset_cfg.get("include_patterns"),
+#             variants=dataset_cfg.get("variants"),
+#             condition_template=dataset_cfg.get("condition_template"),
+#             target_templates=dataset_cfg.get("target_templates"),
+#             target_template=dataset_cfg.get("target_template"),
+#             split=dataset_cfg.get("split"),
+#             split_seed=dataset_cfg.get("split_seed", 1234),
+#             train_ratio=dataset_cfg.get("train_ratio", 0.9),
+#             **common_kwargs,
+#         )
+#     raise ValueError(f"Unsupported dataset type: {dataset_type}")
+
+
+# def build_loader(
+#     dataset_cfg: dict,
+#     batch_size: int,
+#     shuffle: bool,
+#     num_workers: int,
+#     distributed: bool = False,
+#     rank: int = 0,
+#     world_size: int = 1,
+# ):
+#     dataset = build_dataset(dataset_cfg)
+#     sampler = None
+#     if distributed:
+#         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=shuffle, drop_last=shuffle)
+#     loader = DataLoader(
+#         dataset,
+#         batch_size=batch_size,
+#         shuffle=shuffle if sampler is None else False,
+#         sampler=sampler,
+#         num_workers=num_workers,
+#         pin_memory=torch.cuda.is_available(),
+#         drop_last=shuffle,
+#     )
+#     return dataset, loader, sampler
+
+
+# def setup_distributed(device_cfg: str | None = None) -> dict:
+#     world_size = int(os.environ.get("WORLD_SIZE", "1"))
+#     distributed = world_size > 1
+#     if not distributed:
+#         device = pick_device(device_cfg)
+#         return {
+#             "distributed": False,
+#             "rank": 0,
+#             "world_size": 1,
+#             "local_rank": 0,
+#             "device": device,
+#             "is_main": True,
+#         }
+
+#     rank = int(os.environ["RANK"])
+#     local_rank = int(os.environ.get("LOCAL_RANK", rank % max(torch.cuda.device_count(), 1)))
+#     backend = "nccl" if torch.cuda.is_available() else "gloo"
+#     if torch.cuda.is_available():
+#         torch.cuda.set_device(local_rank)
+#         device = torch.device("cuda", local_rank)
+#     else:
+#         device = torch.device("cpu")
+#     dist.init_process_group(backend=backend)
+#     return {
+#         "distributed": True,
+#         "rank": rank,
+#         "world_size": world_size,
+#         "local_rank": local_rank,
+#         "device": device,
+#         "is_main": rank == 0,
+#     }
+
+
+# def cleanup_distributed(distributed: bool) -> None:
+#     if distributed and dist.is_initialized():
+#         dist.destroy_process_group()
+
+
+# def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+#     return model.module if isinstance(model, DDP) else model
+
+
+# def maybe_init_swanlab(cfg: dict):
+#     if not cfg.get("use_swanlab", False):
+#         return None
+#     try:
+#         import swanlab
+#     except ImportError:
+#         print("swanlab is not installed, training will continue without it.")
+#         return None
+#     run_id = os.environ.get("SWANLAB_RUN_ID", cfg.get("run_id"))
+#     resume = os.environ.get("SWANLAB_RESUME", cfg.get("resume"))
+#     mode = os.environ.get("SWANLAB_MODE", cfg.get("mode"))
+#     logdir = os.environ.get("SWANLAB_LOGDIR", cfg.get("logdir"))
+#     settings = {
+#         "project": cfg.get("project", "palette_decoupling"),
+#         "experiment_name": cfg.get("experiment_name"),
+#         "config": cfg,
+#     }
+#     if run_id:
+#         settings["id"] = run_id
+#     if resume is not None:
+#         settings["resume"] = resume
+#     if mode:
+#         settings["mode"] = mode
+#     if logdir:
+#         settings["logdir"] = logdir
+#     print(
+#         {
+#             "swanlab_project": settings.get("project"),
+#             "swanlab_run_id": settings.get("id"),
+#             "swanlab_resume": settings.get("resume"),
+#             "swanlab_mode": settings.get("mode"),
+#             "swanlab_logdir": settings.get("logdir"),
+#         }
+#     )
+#     return swanlab.init(**settings)
+
+
+# class EMA:
+#     def __init__(self, model: torch.nn.Module, decay: float):
+#         self.decay = decay
+#         self.ema_model = copy.deepcopy(model).eval()
+#         for parameter in self.ema_model.parameters():
+#             parameter.requires_grad_(False)
+
+#     @torch.no_grad()
+#     def update(self, model: torch.nn.Module) -> None:
+#         ema_state = self.ema_model.state_dict()
+#         model_state = model.state_dict()
+#         for key, value in ema_state.items():
+#             if not torch.is_floating_point(value):
+#                 value.copy_(model_state[key])
+#             else:
+#                 value.mul_(self.decay).add_(model_state[key], alpha=1.0 - self.decay)
+
+
+# def run_sampler(
+#     model: GaussianConditionalDiffusion,
+#     condition: torch.Tensor,
+#     sample_cfg: dict,
+#     side_labels: torch.Tensor | None = None,
+# ) -> torch.Tensor:
+#     sampler = sample_cfg.get("sampler", "ddim")
+#     steps = sample_cfg.get("steps", 50)
+#     if sampler == "ddim":
+#         return model.sample_ddim(condition, sample_steps=steps, eta=sample_cfg.get("eta", 0.0), side_labels=side_labels)
+#     if sampler == "ddpm":
+#         return model.sample(condition, sample_steps=steps, side_labels=side_labels)
+#     raise ValueError(f"Unsupported sampler: {sampler}")
+
+
+# def is_better_metric(metric_name: str, current: float, best: float) -> bool:
+#     if metric_name in {"val_ssim", "psnr", "val_psnr"}:
+#         return current > best
+#     return current < best
+
+
+# def resolve_step_lr(train_cfg: dict, step: int) -> float:
+#     base_lr = float(train_cfg["lr"])
+#     schedule_cfg = train_cfg.get("lr_schedule", {})
+#     if not schedule_cfg or not schedule_cfg.get("enabled", False):
+#         return base_lr
+#     schedule_type = schedule_cfg.get("type", "step")
+#     if schedule_type == "step":
+#         current_lr = base_lr
+#         schedule_steps = schedule_cfg.get("steps", [])
+#         for item in sorted(schedule_steps, key=lambda entry: int(entry["step"])):
+#             if step >= int(item["step"]):
+#                 current_lr = float(item["lr"])
+#             else:
+#                 break
+#         return current_lr
+#     if schedule_type in {"cosine", "cosine_with_warmup"}:
+#         max_steps = int(train_cfg["max_steps"])
+#         warmup_steps = int(schedule_cfg.get("warmup_steps", 0))
+#         warmup_start_lr = float(schedule_cfg.get("warmup_start_lr", 0.0))
+#         min_lr = float(schedule_cfg.get("min_lr", 0.0))
+#         if warmup_steps > 0 and step <= warmup_steps:
+#             warmup_progress = step / max(warmup_steps, 1)
+#             return warmup_start_lr + warmup_progress * (base_lr - warmup_start_lr)
+#         cosine_total = max(1, max_steps - warmup_steps)
+#         cosine_progress = min(max((step - warmup_steps) / cosine_total, 0.0), 1.0)
+#         cosine_decay = 0.5 * (1.0 + math.cos(math.pi * cosine_progress))
+#         return min_lr + (base_lr - min_lr) * cosine_decay
+#     current_lr = base_lr
+#     raise ValueError(f"Unsupported lr_schedule type: {schedule_type}")
+
+
+# def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
+#     for param_group in optimizer.param_groups:
+#         param_group["lr"] = lr
+
+
+# def get_optimizer_lr(optimizer: torch.optim.Optimizer) -> float:
+#     return float(optimizer.param_groups[0]["lr"])
+
+
+# def compute_early_stop_score(val_metrics: dict[str, float], early_stop_cfg: dict) -> float:
+#     score_cfg = early_stop_cfg.get("score", {})
+#     mae_weight = float(score_cfg.get("mae_weight", 1.0))
+#     ssim_weight = float(score_cfg.get("ssim_weight", 1.0))
+#     return ssim_weight * float(val_metrics["val_ssim"]) - mae_weight * float(val_metrics["val_mae"])
+
+
+# def get_batch_side_labels(batch: dict, device: torch.device) -> torch.Tensor | None:
+#     side = batch.get("side")
+#     if side is None:
+#         return None
+#     if not isinstance(side, torch.Tensor):
+#         raise TypeError("batch['side'] must be a torch.Tensor")
+#     return side.to(device=device, dtype=torch.long)
+
+
+# @torch.no_grad()
+# def validate(model, loader, device, sample_cfg: dict, max_batches: int | None = None, compute_fid: bool = False) -> dict[str, float]:
+#     model.eval()
+#     losses: list[float] = []
+#     maes: list[float] = []
+#     mses: list[float] = []
+#     psnrs: list[float] = []
+#     ssims: list[float] = []
+#     fid_preds = []
+#     fid_targets = []
+#     progress_total = min(len(loader), max_batches) if max_batches is not None else len(loader)
+#     for batch_idx, batch in enumerate(tqdm(loader, desc="validate", leave=False, total=progress_total)):
+#         if max_batches is not None and batch_idx >= max_batches:
+#             break
+#         condition = batch["condition"].to(device)
+#         target = batch["target"].to(device)
+#         side_labels = get_batch_side_labels(batch, device)
+#         loss = model(target, condition, side_labels=side_labels)
+#         pred = run_sampler(model, condition, sample_cfg, side_labels=side_labels)
+#         losses.append(float(loss.item()))
+#         maes.append(mae(pred, target))
+#         mses.append(mse(pred, target))
+#         psnrs.append(psnr(pred, target))
+#         ssims.append(ssim(pred, target))
+#         if compute_fid:
+#             fid_preds.append(pred.detach().cpu())
+#             fid_targets.append(target.detach().cpu())
+
+#     metrics = {
+#         "val_loss": sum(losses) / max(len(losses), 1),
+#         "val_mae": sum(maes) / max(len(maes), 1),
+#         "val_mse": sum(mses) / max(len(mses), 1),
+#         "val_psnr": sum(psnrs) / max(len(psnrs), 1),
+#         "val_ssim": sum(ssims) / max(len(ssims), 1),
+#     }
+#     if compute_fid and fid_preds:
+#         pred_tensor = torch.cat(fid_preds, dim=0)
+#         target_tensor = torch.cat(fid_targets, dim=0)
+#         try:
+#             fid_per_channel = compute_channelwise_fid(pred_tensor, target_tensor)
+#             metrics["fid_mean"] = float(sum(fid_per_channel) / len(fid_per_channel))
+#         except Exception as exc:
+#             print(f"Skipping FID due to error: {exc}")
+#     return metrics
+
+
+# def save_checkpoint(
+#     path,
+#     model,
+#     optimizer,
+#     ema: EMA,
+#     step: int,
+#     cfg: dict,
+#     best_metric: float | None = None,
+#     best_metrics: dict[str, float] | None = None,
+#     training_state: dict | None = None,
+# ) -> None:
+#     torch.save(
+#         {
+#             "model": model.state_dict(),
+#             "ema_model": ema.ema_model.state_dict(),
+#             "optimizer": optimizer.state_dict(),
+#             "config": cfg,
+#             "step": step,
+#             "best_metric": best_metric,
+#             "best_metrics": best_metrics or {},
+#             "training_state": training_state or {},
+#         },
+#         path,
+#     )
+
+
+# def load_checkpoint(path, model, optimizer, ema: EMA, device: torch.device) -> tuple[int, float, dict[str, float], dict]:
+#     state = torch.load(path, map_location=device)
+#     model.load_state_dict(state["model"])
+#     if "ema_model" in state:
+#         ema.ema_model.load_state_dict(state["ema_model"])
+#     optimizer.load_state_dict(state["optimizer"])
+#     start_step = int(state.get("step", 0))
+#     best_metric = float(state.get("best_metric", float("inf")))
+#     saved_best_metrics = state.get("best_metrics", {})
+#     best_metrics = {str(key): float(value) for key, value in saved_best_metrics.items()}
+#     training_state = dict(state.get("training_state", {}))
+#     return start_step, best_metric, best_metrics, training_state
+
+
+# def main() -> None:
+#     parser = argparse.ArgumentParser(description="Research-style step-based trainer for palette_decoupling.")
+#     parser.add_argument("--config", required=True, help="Path to yaml/json config.")
+#     parser.add_argument("--resume", default=None, help="Optional checkpoint path to resume from.")
+#     args = parser.parse_args()
+
+#     cfg = load_config(args.config)
+#     set_seed(int(cfg.get("seed", 1234)))
+#     dist_ctx = setup_distributed(cfg.get("device"))
+#     device = dist_ctx["device"]
+#     is_main = dist_ctx["is_main"]
+
+#     output_dir = ensure_dir(cfg["output"]["root"])
+#     checkpoint_dir = ensure_dir(output_dir / "checkpoints")
+#     sample_dir = ensure_dir(output_dir / "samples")
+
+#     train_dataset, train_loader, train_sampler = build_loader(
+#         cfg["dataset"]["train"],
+#         batch_size=cfg["train"]["batch_size"],
+#         shuffle=True,
+#         num_workers=cfg["train"].get("num_workers", 0),
+#         distributed=dist_ctx["distributed"],
+#         rank=dist_ctx["rank"],
+#         world_size=dist_ctx["world_size"],
+#     )
+#     val_dataset, val_loader, _ = build_loader(
+#         cfg["dataset"]["val"],
+#         batch_size=cfg["train"].get("val_batch_size", cfg["train"]["batch_size"]),
+#         shuffle=False,
+#         num_workers=cfg["train"].get("num_workers", 0),
+#         distributed=False,
+#     )
+
+#     if is_main:
+#         print(
+#             {
+#                 "device": str(device),
+#                 "rank": dist_ctx["rank"],
+#                 "world_size": dist_ctx["world_size"],
+#                 "train_samples": len(train_dataset),
+#                 "val_samples": len(val_dataset),
+#                 "condition_channels": train_dataset.condition_channels,
+#                 "target_channels": train_dataset.target_channels,
+#             }
+#         )
+
+#     image_size = cfg["model"].get("image_size") or train_dataset[0]["condition"].shape[-1]
+#     model = GaussianConditionalDiffusion(
+#         condition_channels=train_dataset.condition_channels,
+#         target_channels=train_dataset.target_channels,
+#         image_size=image_size,
+#         inner_channel=cfg["model"]["inner_channel"],
+#         channel_mults=cfg["model"]["channel_mults"],
+#         attn_res=cfg["model"]["attn_res"],
+#         res_blocks=cfg["model"]["res_blocks"],
+#         dropout=cfg["model"].get("dropout", 0.0),
+#         beta_schedule=cfg["diffusion"]["beta_schedule"],
+#         num_side_classes=getattr(train_dataset, "num_side_classes", None),
+#         branch_decoder_cfg=cfg["model"].get("branch_decoder"),
+#         branch_loss_weights=cfg["diffusion"].get("branch_loss_weights"),
+#     ).to(device)
+#     if is_main:
+#         print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+#     optimizer = torch.optim.AdamW(
+#         model.parameters(),
+#         lr=cfg["train"]["lr"],
+#         weight_decay=cfg["train"].get("weight_decay", 0.0),
+#     )
+#     ema = EMA(model, decay=cfg["train"].get("ema_decay", 0.9999))
+#     if dist_ctx["distributed"]:
+#         model = DDP(model, device_ids=[dist_ctx["local_rank"]] if device.type == "cuda" else None, output_device=dist_ctx["local_rank"] if device.type == "cuda" else None)
+#     run = maybe_init_swanlab(cfg.get("logging", {})) if is_main else None
+
+#     max_steps = int(cfg["train"]["max_steps"])
+#     validate_every = int(cfg["train"]["validate_every_steps"])
+#     save_every = int(cfg["train"].get("save_every_steps", validate_every))
+#     log_every = int(cfg["train"].get("log_every_steps", 50))
+#     ema_start = int(cfg["train"].get("ema_start_step", 0))
+#     fid_every = int(cfg["validation"].get("fid_every_steps", validate_every))
+#     best_metric_name = cfg["train"].get("best_metric", "val_mae")
+#     best_metric = float("-inf") if best_metric_name in {"val_ssim", "psnr", "val_psnr"} else float("inf")
+#     best_metrics = {
+#         "val_mae": float("inf"),
+#         "val_ssim": float("-inf"),
+#     }
+#     early_stop_cfg = cfg["train"].get("early_stop", {})
+#     early_stop_enabled = bool(early_stop_cfg.get("enabled", False))
+#     early_stop_patience = int(early_stop_cfg.get("patience_validations", 20))
+#     early_stop_min_delta = float(early_stop_cfg.get("min_delta", 0.0))
+#     early_stop_best_score = float("-inf")
+#     early_stop_bad_validations = 0
+#     start_step = 0
+
+#     resume_path = args.resume or cfg["train"].get("resume_checkpoint")
+#     if resume_path:
+#         start_step, best_metric, loaded_best_metrics, training_state = load_checkpoint(resume_path, model, optimizer, ema, device)
+#         best_metrics.update(loaded_best_metrics)
+#         early_stop_best_score = float(training_state.get("early_stop_best_score", early_stop_best_score))
+#         early_stop_bad_validations = int(training_state.get("early_stop_bad_validations", early_stop_bad_validations))
+#         if is_main:
+#             print(
+#                 {
+#                     "resumed_from": resume_path,
+#                     "start_step": start_step,
+#                     "best_metric": best_metric,
+#                     "best_metrics": best_metrics,
+#                     "early_stop_best_score": early_stop_best_score,
+#                     "early_stop_bad_validations": early_stop_bad_validations,
+#                 }
+#             )
+
+#     progress = tqdm(
+#         range(start_step + 1, max_steps + 1),
+#         desc="train steps",
+#         leave=True,
+#         initial=start_step,
+#         total=max_steps,
+#         dynamic_ncols=True,
+#         mininterval=1.0,
+#         disable=not is_main,
+#     )
+#     recent_losses: list[float] = []
+#     train_epoch = 0
+#     if train_sampler is not None:
+#         train_sampler.set_epoch(train_epoch)
+#     train_iter = iter(train_loader)
+
+#     try:
+#         for step in progress:
+#             current_lr = resolve_step_lr(cfg["train"], step)
+#             set_optimizer_lr(optimizer, current_lr)
+#             try:
+#                 batch = next(train_iter)
+#             except StopIteration:
+#                 train_epoch += 1
+#                 if train_sampler is not None:
+#                     train_sampler.set_epoch(train_epoch)
+#                 train_iter = iter(train_loader)
+#                 batch = next(train_iter)
+
+#             model.train()
+#             condition = batch["condition"].to(device)
+#             target = batch["target"].to(device)
+#             side_labels = get_batch_side_labels(batch, device)
+#             optimizer.zero_grad(set_to_none=True)
+#             loss = model(target, condition, side_labels=side_labels)
+#             loss.backward()
+#             optimizer.step()
+#             if step >= ema_start:
+#                 ema.update(unwrap_model(model))
+
+#             loss_value = float(loss.item())
+#             recent_losses.append(loss_value)
+#             if len(recent_losses) > log_every:
+#                 recent_losses.pop(0)
+#             if is_main:
+#                 progress.set_postfix(loss=f"{loss_value:.6f}", avg=f"{sum(recent_losses)/len(recent_losses):.6f}")
+
+#             if run is not None and step % log_every == 0:
+#                 run.log({"step": step, "train_loss": sum(recent_losses) / len(recent_losses), "lr": get_optimizer_lr(optimizer)})
+
+#             should_stop = False
+#             if step % validate_every == 0 or step == max_steps:
+#                 if dist_ctx["distributed"]:
+#                     dist.barrier()
+#                 if is_main:
+#                     eval_model = ema.ema_model
+#                     val_metrics = validate(
+#                         eval_model,
+#                         val_loader,
+#                         device,
+#                         sample_cfg=cfg["validation"]["sampler"],
+#                         max_batches=cfg["validation"].get("max_batches"),
+#                         compute_fid=(fid_every > 0 and step % fid_every == 0),
+#                     )
+#                     val_metrics["lr"] = get_optimizer_lr(optimizer)
+#                     val_metrics["step"] = step
+#                     print(val_metrics)
+#                     if run is not None:
+#                         run.log(val_metrics)
+
+#                     current_mae = float(val_metrics["val_mae"])
+#                     if current_mae < best_metrics["val_mae"]:
+#                         best_metrics["val_mae"] = current_mae
+#                         save_checkpoint(
+#                             checkpoint_dir / "best_ema_mae.pt",
+#                             unwrap_model(model),
+#                             optimizer,
+#                             ema,
+#                             step,
+#                             cfg,
+#                             best_metric=current_mae,
+#                             best_metrics=best_metrics,
+#                             training_state={
+#                                 "early_stop_best_score": early_stop_best_score,
+#                                 "early_stop_bad_validations": early_stop_bad_validations,
+#                             },
+#                         )
+
+#                     current_ssim = float(val_metrics["val_ssim"])
+#                     if current_ssim > best_metrics["val_ssim"]:
+#                         best_metrics["val_ssim"] = current_ssim
+#                         save_checkpoint(
+#                             checkpoint_dir / "best_ema_ssim.pt",
+#                             unwrap_model(model),
+#                             optimizer,
+#                             ema,
+#                             step,
+#                             cfg,
+#                             best_metric=current_ssim,
+#                             best_metrics=best_metrics,
+#                             training_state={
+#                                 "early_stop_best_score": early_stop_best_score,
+#                                 "early_stop_bad_validations": early_stop_bad_validations,
+#                             },
+#                         )
+
+#                     metric_value = float(val_metrics.get(best_metric_name, val_metrics["val_mae"]))
+#                     if is_better_metric(best_metric_name, metric_value, best_metric):
+#                         best_metric = metric_value
+#                         save_checkpoint(
+#                             checkpoint_dir / "best_ema.pt",
+#                             unwrap_model(model),
+#                             optimizer,
+#                             ema,
+#                             step,
+#                             cfg,
+#                             best_metric=best_metric,
+#                             best_metrics=best_metrics,
+#                             training_state={
+#                                 "early_stop_best_score": early_stop_best_score,
+#                                 "early_stop_bad_validations": early_stop_bad_validations,
+#                             },
+#                         )
+
+#                     if early_stop_enabled:
+#                         current_score = compute_early_stop_score(val_metrics, early_stop_cfg)
+#                         val_metrics["early_stop_score"] = current_score
+#                         if current_score > early_stop_best_score + early_stop_min_delta:
+#                             early_stop_best_score = current_score
+#                             early_stop_bad_validations = 0
+#                         else:
+#                             early_stop_bad_validations += 1
+#                         print(
+#                             {
+#                                 "early_stop_score": current_score,
+#                                 "early_stop_best_score": early_stop_best_score,
+#                                 "early_stop_bad_validations": early_stop_bad_validations,
+#                                 "early_stop_patience": early_stop_patience,
+#                             }
+#                         )
+#                         if run is not None:
+#                             run.log(
+#                                 {
+#                                     "step": step,
+#                                     "early_stop_score": current_score,
+#                                     "early_stop_best_score": early_stop_best_score,
+#                                     "early_stop_bad_validations": early_stop_bad_validations,
+#                                 }
+#                             )
+
+#                     preview_batch = next(iter(val_loader))
+#                     preview_condition = preview_batch["condition"].to(device)
+#                     preview_side_labels = get_batch_side_labels(preview_batch, device)
+#                     preview_pred = run_sampler(eval_model, preview_condition, cfg["validation"]["sampler"], side_labels=preview_side_labels)
+#                     preview_name = str(preview_batch["name"][0])
+#                     save_tensor_npy(preview_pred[0], sample_dir / f"step_{step:06d}_{preview_name}_pred.npy")
+#                     for channel_idx in range(preview_pred.shape[1]):
+#                         save_tensor_png(preview_pred[0, channel_idx : channel_idx + 1], sample_dir / f"step_{step:06d}_{preview_name}_ch{channel_idx}.png")
+
+#                     if early_stop_enabled and early_stop_bad_validations >= early_stop_patience:
+#                         print(
+#                             {
+#                                 "early_stop_triggered": True,
+#                                 "step": step,
+#                                 "early_stop_best_score": early_stop_best_score,
+#                                 "early_stop_bad_validations": early_stop_bad_validations,
+#                             }
+#                         )
+#                         should_stop = True
+
+#                 if dist_ctx["distributed"]:
+#                     stop_tensor = torch.tensor(1 if (should_stop and is_main) else 0, device=device)
+#                     dist.broadcast(stop_tensor, src=0)
+#                     should_stop = bool(stop_tensor.item())
+#                     dist.barrier()
+
+#             if is_main and (step % save_every == 0 or step == max_steps):
+#                 save_checkpoint(
+#                     checkpoint_dir / f"step_{step:06d}.pt",
+#                     unwrap_model(model),
+#                     optimizer,
+#                     ema,
+#                     step,
+#                     cfg,
+#                     best_metric=best_metric,
+#                     best_metrics=best_metrics,
+#                     training_state={
+#                         "early_stop_best_score": early_stop_best_score,
+#                         "early_stop_bad_validations": early_stop_bad_validations,
+#                     },
+#                 )
+#                 save_checkpoint(
+#                     checkpoint_dir / "last.pt",
+#                     unwrap_model(model),
+#                     optimizer,
+#                     ema,
+#                     step,
+#                     cfg,
+#                     best_metric=best_metric,
+#                     best_metrics=best_metrics,
+#                     training_state={
+#                         "early_stop_best_score": early_stop_best_score,
+#                         "early_stop_bad_validations": early_stop_bad_validations,
+#                     },
+#                 )
+
+#             if should_stop:
+#                 break
+
+#         if run is not None:
+#             run.finish()
+#     finally:
+#         cleanup_distributed(dist_ctx["distributed"])
+
+
+# if __name__ == "__main__":
+#     main()
+
 from __future__ import annotations
 
 import argparse
 import copy
 import math
 import os
-from itertools import cycle
+import random
+
+import numpy as np
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from .config import ensure_dir, load_config
@@ -55,17 +1307,71 @@ def build_dataset(dataset_cfg: dict):
     raise ValueError(f"Unsupported dataset type: {dataset_type}")
 
 
-def build_loader(dataset_cfg: dict, batch_size: int, shuffle: bool, num_workers: int):
+def build_loader(
+    dataset_cfg: dict,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int,
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
+):
     dataset = build_dataset(dataset_cfg)
+    sampler = None
+    if distributed:
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=shuffle, drop_last=shuffle)
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=shuffle if sampler is None else False,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
         drop_last=shuffle,
     )
-    return dataset, loader
+    return dataset, loader, sampler
+
+
+def setup_distributed(device_cfg: str | None = None) -> dict:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    distributed = world_size > 1
+    if not distributed:
+        device = pick_device(device_cfg)
+        return {
+            "distributed": False,
+            "rank": 0,
+            "world_size": 1,
+            "local_rank": 0,
+            "device": device,
+            "is_main": True,
+        }
+
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ.get("LOCAL_RANK", rank % max(torch.cuda.device_count(), 1)))
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+    else:
+        device = torch.device("cpu")
+    dist.init_process_group(backend=backend)
+    return {
+        "distributed": True,
+        "rank": rank,
+        "world_size": world_size,
+        "local_rank": local_rank,
+        "device": device,
+        "is_main": rank == 0,
+    }
+
+
+def cleanup_distributed(distributed: bool) -> None:
+    if distributed and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    return model.module if isinstance(model, DDP) else model
 
 
 def maybe_init_swanlab(cfg: dict):
@@ -103,6 +1409,71 @@ def maybe_init_swanlab(cfg: dict):
         }
     )
     return swanlab.init(**settings)
+
+
+def capture_rng_state() -> dict:
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def restore_rng_state(rng_state: dict | None) -> None:
+    if not rng_state:
+        return
+    python_state = rng_state.get("python")
+    numpy_state = rng_state.get("numpy")
+    torch_state = rng_state.get("torch")
+    cuda_state = rng_state.get("cuda")
+    if python_state is not None:
+        random.setstate(python_state)
+    if numpy_state is not None:
+        np.random.set_state(numpy_state)
+    if torch_state is not None:
+        torch.set_rng_state(torch_state)
+    if cuda_state is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(cuda_state)
+
+
+def normalize_training_progress(train_epoch: int, batches_seen_in_epoch: int, batches_per_epoch: int) -> tuple[int, int]:
+    if batches_per_epoch <= 0:
+        return train_epoch, batches_seen_in_epoch
+    normalized_epoch = train_epoch + batches_seen_in_epoch // batches_per_epoch
+    normalized_batches = batches_seen_in_epoch % batches_per_epoch
+    return normalized_epoch, normalized_batches
+
+
+def restore_train_iterator(train_loader, train_sampler, train_epoch: int, batches_seen_in_epoch: int):
+    if train_sampler is not None:
+        train_sampler.set_epoch(train_epoch)
+    train_iter = iter(train_loader)
+    for _ in range(batches_seen_in_epoch):
+        try:
+            next(train_iter)
+        except StopIteration:
+            break
+    return train_iter
+
+
+def build_training_state(
+    early_stop_best_score: float,
+    early_stop_bad_validations: int,
+    train_epoch: int,
+    batches_seen_in_epoch: int,
+    batches_per_epoch: int,
+    recent_losses: list[float],
+) -> dict:
+    normalized_epoch, normalized_batches = normalize_training_progress(train_epoch, batches_seen_in_epoch, batches_per_epoch)
+    return {
+        "early_stop_best_score": early_stop_best_score,
+        "early_stop_bad_validations": early_stop_bad_validations,
+        "train_epoch": normalized_epoch,
+        "batches_seen_in_epoch": normalized_batches,
+        "recent_losses": list(recent_losses),
+        "rng_state": capture_rng_state(),
+    }
 
 
 class EMA:
@@ -272,19 +1643,51 @@ def save_checkpoint(
     )
 
 
+# def load_checkpoint(path, model, optimizer, ema: EMA, device: torch.device) -> tuple[int, float, dict[str, float], dict]:
+#     state = torch.load(path, map_location=device)
+#     unwrap_model(model).load_state_dict(state["model"])
+#     if "ema_model" in state:
+#         ema.ema_model.load_state_dict(state["ema_model"])
+#     optimizer.load_state_dict(state["optimizer"])
+#     start_step = int(state.get("step", 0))
+#     best_metric = float(state.get("best_metric", float("inf")))
+#     saved_best_metrics = state.get("best_metrics", {})
+#     best_metrics = {str(key): float(value) for key, value in saved_best_metrics.items()}
+#     training_state = dict(state.get("training_state", {}))
+#     return start_step, best_metric, best_metrics, training_state
+# def load_checkpoint(path, model, optimizer, ema: EMA, device: torch.device) -> tuple[int, float, dict[str, float], dict]:
+#     state = torch.load(path, map_location=device)
+    
+#     # 关键修改：添加 strict=False
+#     unwrap_model(model).load_state_dict(state["model"], strict=False)
+    
+#     if "ema_model" in state:
+#         ema.ema_model.load_state_dict(state["ema_model"], strict=False)
+    
+#     optimizer.load_state_dict(state["optimizer"])
+#     start_step = int(state.get("step", 0))
+#     best_metric = float(state.get("best_metric", float("inf")))
+#     saved_best_metrics = state.get("best_metrics", {})
+#     best_metrics = {str(key): float(value) for key, value in saved_best_metrics.items()}
+#     training_state = dict(state.get("training_state", {}))
+#     return start_step, best_metric, best_metrics, training_state
 def load_checkpoint(path, model, optimizer, ema: EMA, device: torch.device) -> tuple[int, float, dict[str, float], dict]:
-    state = torch.load(path, map_location=device)
-    model.load_state_dict(state["model"])
+    state = torch.load(path, map_location=device, weights_only=False)
+
+    unwrap_model(model).load_state_dict(state["model"], strict=False)
+
     if "ema_model" in state:
-        ema.ema_model.load_state_dict(state["ema_model"])
-    optimizer.load_state_dict(state["optimizer"])
+        ema.ema_model.load_state_dict(state["ema_model"], strict=False)
+
+    if "optimizer" in state:
+        optimizer.load_state_dict(state["optimizer"])
+
     start_step = int(state.get("step", 0))
     best_metric = float(state.get("best_metric", float("inf")))
     saved_best_metrics = state.get("best_metrics", {})
     best_metrics = {str(key): float(value) for key, value in saved_best_metrics.items()}
     training_state = dict(state.get("training_state", {}))
     return start_step, best_metric, best_metrics, training_state
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Research-style step-based trainer for palette_decoupling.")
@@ -294,34 +1697,43 @@ def main() -> None:
 
     cfg = load_config(args.config)
     set_seed(int(cfg.get("seed", 1234)))
-    device = pick_device(cfg.get("device"))
+    dist_ctx = setup_distributed(cfg.get("device"))
+    device = dist_ctx["device"]
+    is_main = dist_ctx["is_main"]
 
     output_dir = ensure_dir(cfg["output"]["root"])
     checkpoint_dir = ensure_dir(output_dir / "checkpoints")
     sample_dir = ensure_dir(output_dir / "samples")
 
-    train_dataset, train_loader = build_loader(
+    train_dataset, train_loader, train_sampler = build_loader(
         cfg["dataset"]["train"],
         batch_size=cfg["train"]["batch_size"],
         shuffle=True,
         num_workers=cfg["train"].get("num_workers", 0),
+        distributed=dist_ctx["distributed"],
+        rank=dist_ctx["rank"],
+        world_size=dist_ctx["world_size"],
     )
-    val_dataset, val_loader = build_loader(
+    val_dataset, val_loader, _ = build_loader(
         cfg["dataset"]["val"],
         batch_size=cfg["train"].get("val_batch_size", cfg["train"]["batch_size"]),
         shuffle=False,
         num_workers=cfg["train"].get("num_workers", 0),
+        distributed=False,
     )
 
-    print(
-        {
-            "device": str(device),
-            "train_samples": len(train_dataset),
-            "val_samples": len(val_dataset),
-            "condition_channels": train_dataset.condition_channels,
-            "target_channels": train_dataset.target_channels,
-        }
-    )
+    if is_main:
+        print(
+            {
+                "device": str(device),
+                "rank": dist_ctx["rank"],
+                "world_size": dist_ctx["world_size"],
+                "train_samples": len(train_dataset),
+                "val_samples": len(val_dataset),
+                "condition_channels": train_dataset.condition_channels,
+                "target_channels": train_dataset.target_channels,
+            }
+        )
 
     image_size = cfg["model"].get("image_size") or train_dataset[0]["condition"].shape[-1]
     model = GaussianConditionalDiffusion(
@@ -335,8 +1747,11 @@ def main() -> None:
         dropout=cfg["model"].get("dropout", 0.0),
         beta_schedule=cfg["diffusion"]["beta_schedule"],
         num_side_classes=getattr(train_dataset, "num_side_classes", None),
+        branch_decoder_cfg=cfg["model"].get("branch_decoder"),
+        branch_loss_weights=cfg["diffusion"].get("branch_loss_weights"),
     ).to(device)
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    if is_main:
+        print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -344,7 +1759,9 @@ def main() -> None:
         weight_decay=cfg["train"].get("weight_decay", 0.0),
     )
     ema = EMA(model, decay=cfg["train"].get("ema_decay", 0.9999))
-    run = maybe_init_swanlab(cfg.get("logging", {}))
+    if dist_ctx["distributed"]:
+        model = DDP(model, device_ids=[dist_ctx["local_rank"]] if device.type == "cuda" else None, output_device=dist_ctx["local_rank"] if device.type == "cuda" else None)
+    run = maybe_init_swanlab(cfg.get("logging", {})) if is_main else None
 
     max_steps = int(cfg["train"]["max_steps"])
     validate_every = int(cfg["train"]["validate_every_steps"])
@@ -365,6 +1782,9 @@ def main() -> None:
     early_stop_best_score = float("-inf")
     early_stop_bad_validations = 0
     start_step = 0
+    recent_losses: list[float] = []
+    train_epoch = 0
+    batches_seen_in_epoch = 0
 
     resume_path = args.resume or cfg["train"].get("resume_checkpoint")
     if resume_path:
@@ -372,18 +1792,25 @@ def main() -> None:
         best_metrics.update(loaded_best_metrics)
         early_stop_best_score = float(training_state.get("early_stop_best_score", early_stop_best_score))
         early_stop_bad_validations = int(training_state.get("early_stop_bad_validations", early_stop_bad_validations))
-        print(
-            {
-                "resumed_from": resume_path,
-                "start_step": start_step,
-                "best_metric": best_metric,
-                "best_metrics": best_metrics,
-                "early_stop_best_score": early_stop_best_score,
-                "early_stop_bad_validations": early_stop_bad_validations,
-            }
-        )
+        train_epoch = int(training_state.get("train_epoch", train_epoch))
+        batches_seen_in_epoch = int(training_state.get("batches_seen_in_epoch", batches_seen_in_epoch))
+        saved_recent_losses = training_state.get("recent_losses", recent_losses)
+        recent_losses = [float(item) for item in saved_recent_losses][-log_every:]
+        #restore_rng_state(training_state.get("rng_state"))
+        if is_main:
+            print(
+                {
+                    "resumed_from": resume_path,
+                    "start_step": start_step,
+                    "best_metric": best_metric,
+                    "best_metrics": best_metrics,
+                    "early_stop_best_score": early_stop_best_score,
+                    "early_stop_bad_validations": early_stop_bad_validations,
+                    "train_epoch": train_epoch,
+                    "batches_seen_in_epoch": batches_seen_in_epoch,
+                }
+            )
 
-    train_iter = cycle(train_loader)
     progress = tqdm(
         range(start_step + 1, max_steps + 1),
         desc="train steps",
@@ -392,181 +1819,229 @@ def main() -> None:
         total=max_steps,
         dynamic_ncols=True,
         mininterval=1.0,
+        disable=not is_main,
     )
-    recent_losses: list[float] = []
+    train_epoch, batches_seen_in_epoch = normalize_training_progress(train_epoch, batches_seen_in_epoch, len(train_loader))
+    train_iter = restore_train_iterator(train_loader, train_sampler, train_epoch, batches_seen_in_epoch)
 
-    for step in progress:
-        current_lr = resolve_step_lr(cfg["train"], step)
-        set_optimizer_lr(optimizer, current_lr)
-        batch = next(train_iter)
-        model.train()
-        condition = batch["condition"].to(device)
-        target = batch["target"].to(device)
-        side_labels = get_batch_side_labels(batch, device)
-        optimizer.zero_grad(set_to_none=True)
-        loss = model(target, condition, side_labels=side_labels)
-        loss.backward()
-        optimizer.step()
-        if step >= ema_start:
-            ema.update(model)
+    try:
+        for step in progress:
+            current_lr = resolve_step_lr(cfg["train"], step)
+            set_optimizer_lr(optimizer, current_lr)
+            try:
+                batch = next(train_iter)
+                batches_seen_in_epoch += 1
+            except StopIteration:
+                train_epoch += 1
+                batches_seen_in_epoch = 0
+                train_iter = restore_train_iterator(train_loader, train_sampler, train_epoch, batches_seen_in_epoch)
+                batch = next(train_iter)
+                batches_seen_in_epoch = 1
 
-        loss_value = float(loss.item())
-        recent_losses.append(loss_value)
-        if len(recent_losses) > log_every:
-            recent_losses.pop(0)
-        progress.set_postfix(loss=f"{loss_value:.6f}", avg=f"{sum(recent_losses)/len(recent_losses):.6f}")
+            model.train()
+            condition = batch["condition"].to(device)
+            target = batch["target"].to(device)
+            side_labels = get_batch_side_labels(batch, device)
+            optimizer.zero_grad(set_to_none=True)
+            loss = model(target, condition, side_labels=side_labels)
+            loss.backward()
+            optimizer.step()
+            if step >= ema_start:
+                ema.update(unwrap_model(model))
 
-        if run is not None and step % log_every == 0:
-            run.log({"step": step, "train_loss": sum(recent_losses) / len(recent_losses), "lr": get_optimizer_lr(optimizer)})
+            loss_value = float(loss.item())
+            recent_losses.append(loss_value)
+            if len(recent_losses) > log_every:
+                recent_losses.pop(0)
+            if is_main:
+                progress.set_postfix(loss=f"{loss_value:.6f}", avg=f"{sum(recent_losses)/len(recent_losses):.6f}")
 
-        if step % validate_every == 0 or step == max_steps:
-            eval_model = ema.ema_model
-            val_metrics = validate(
-                eval_model,
-                val_loader,
-                device,
-                sample_cfg=cfg["validation"]["sampler"],
-                max_batches=cfg["validation"].get("max_batches"),
-                compute_fid=(fid_every > 0 and step % fid_every == 0),
-            )
-            val_metrics["lr"] = get_optimizer_lr(optimizer)
-            val_metrics["step"] = step
-            print(val_metrics)
-            if run is not None:
-                run.log(val_metrics)
+            if run is not None and step % log_every == 0:
+                run.log({"step": step, "train_loss": sum(recent_losses) / len(recent_losses), "lr": get_optimizer_lr(optimizer)})
 
-            current_mae = float(val_metrics["val_mae"])
-            if current_mae < best_metrics["val_mae"]:
-                best_metrics["val_mae"] = current_mae
+            should_stop = False
+            if step % validate_every == 0 or step == max_steps:
+                if dist_ctx["distributed"]:
+                    dist.barrier()
+                if is_main:
+                    eval_model = ema.ema_model
+                    val_metrics = validate(
+                        eval_model,
+                        val_loader,
+                        device,
+                        sample_cfg=cfg["validation"]["sampler"],
+                        max_batches=cfg["validation"].get("max_batches"),
+                        compute_fid=(fid_every > 0 and step % fid_every == 0),
+                    )
+                    val_metrics["lr"] = get_optimizer_lr(optimizer)
+                    val_metrics["step"] = step
+                    print(val_metrics)
+                    if run is not None:
+                        run.log(val_metrics)
+
+                    current_mae = float(val_metrics["val_mae"])
+                    if current_mae < best_metrics["val_mae"]:
+                        best_metrics["val_mae"] = current_mae
+                        save_checkpoint(
+                            checkpoint_dir / "best_ema_mae.pt",
+                            unwrap_model(model),
+                            optimizer,
+                            ema,
+                            step,
+                            cfg,
+                            best_metric=current_mae,
+                            best_metrics=best_metrics,
+                            training_state=build_training_state(
+                                early_stop_best_score,
+                                early_stop_bad_validations,
+                                train_epoch,
+                                batches_seen_in_epoch,
+                                len(train_loader),
+                                recent_losses,
+                            ),
+                        )
+
+                    current_ssim = float(val_metrics["val_ssim"])
+                    if current_ssim > best_metrics["val_ssim"]:
+                        best_metrics["val_ssim"] = current_ssim
+                        save_checkpoint(
+                            checkpoint_dir / "best_ema_ssim.pt",
+                            unwrap_model(model),
+                            optimizer,
+                            ema,
+                            step,
+                            cfg,
+                            best_metric=current_ssim,
+                            best_metrics=best_metrics,
+                            training_state=build_training_state(
+                                early_stop_best_score,
+                                early_stop_bad_validations,
+                                train_epoch,
+                                batches_seen_in_epoch,
+                                len(train_loader),
+                                recent_losses,
+                            ),
+                        )
+
+                    metric_value = float(val_metrics.get(best_metric_name, val_metrics["val_mae"]))
+                    if is_better_metric(best_metric_name, metric_value, best_metric):
+                        best_metric = metric_value
+                        save_checkpoint(
+                            checkpoint_dir / "best_ema.pt",
+                            unwrap_model(model),
+                            optimizer,
+                            ema,
+                            step,
+                            cfg,
+                            best_metric=best_metric,
+                            best_metrics=best_metrics,
+                            training_state=build_training_state(
+                                early_stop_best_score,
+                                early_stop_bad_validations,
+                                train_epoch,
+                                batches_seen_in_epoch,
+                                len(train_loader),
+                                recent_losses,
+                            ),
+                        )
+
+                    if early_stop_enabled:
+                        current_score = compute_early_stop_score(val_metrics, early_stop_cfg)
+                        val_metrics["early_stop_score"] = current_score
+                        if current_score > early_stop_best_score + early_stop_min_delta:
+                            early_stop_best_score = current_score
+                            early_stop_bad_validations = 0
+                        else:
+                            early_stop_bad_validations += 1
+                        print(
+                            {
+                                "early_stop_score": current_score,
+                                "early_stop_best_score": early_stop_best_score,
+                                "early_stop_bad_validations": early_stop_bad_validations,
+                                "early_stop_patience": early_stop_patience,
+                            }
+                        )
+                        if run is not None:
+                            run.log(
+                                {
+                                    "step": step,
+                                    "early_stop_score": current_score,
+                                    "early_stop_best_score": early_stop_best_score,
+                                    "early_stop_bad_validations": early_stop_bad_validations,
+                                }
+                            )
+
+                    preview_batch = next(iter(val_loader))
+                    preview_condition = preview_batch["condition"].to(device)
+                    preview_side_labels = get_batch_side_labels(preview_batch, device)
+                    preview_pred = run_sampler(eval_model, preview_condition, cfg["validation"]["sampler"], side_labels=preview_side_labels)
+                    preview_name = str(preview_batch["name"][0])
+                    save_tensor_npy(preview_pred[0], sample_dir / f"step_{step:06d}_{preview_name}_pred.npy")
+                    for channel_idx in range(preview_pred.shape[1]):
+                        save_tensor_png(preview_pred[0, channel_idx : channel_idx + 1], sample_dir / f"step_{step:06d}_{preview_name}_ch{channel_idx}.png")
+
+                    if early_stop_enabled and early_stop_bad_validations >= early_stop_patience:
+                        print(
+                            {
+                                "early_stop_triggered": True,
+                                "step": step,
+                                "early_stop_best_score": early_stop_best_score,
+                                "early_stop_bad_validations": early_stop_bad_validations,
+                            }
+                        )
+                        should_stop = True
+
+                if dist_ctx["distributed"]:
+                    stop_tensor = torch.tensor(1 if (should_stop and is_main) else 0, device=device)
+                    dist.broadcast(stop_tensor, src=0)
+                    should_stop = bool(stop_tensor.item())
+                    dist.barrier()
+
+            if is_main and (step % save_every == 0 or step == max_steps):
                 save_checkpoint(
-                    checkpoint_dir / "best_ema_mae.pt",
-                    model,
-                    optimizer,
-                    ema,
-                    step,
-                    cfg,
-                    best_metric=current_mae,
-                    best_metrics=best_metrics,
-                    training_state={
-                        "early_stop_best_score": early_stop_best_score,
-                        "early_stop_bad_validations": early_stop_bad_validations,
-                    },
-                )
-
-            current_ssim = float(val_metrics["val_ssim"])
-            if current_ssim > best_metrics["val_ssim"]:
-                best_metrics["val_ssim"] = current_ssim
-                save_checkpoint(
-                    checkpoint_dir / "best_ema_ssim.pt",
-                    model,
-                    optimizer,
-                    ema,
-                    step,
-                    cfg,
-                    best_metric=current_ssim,
-                    best_metrics=best_metrics,
-                    training_state={
-                        "early_stop_best_score": early_stop_best_score,
-                        "early_stop_bad_validations": early_stop_bad_validations,
-                    },
-                )
-
-            metric_value = float(val_metrics.get(best_metric_name, val_metrics["val_mae"]))
-            if is_better_metric(best_metric_name, metric_value, best_metric):
-                best_metric = metric_value
-                save_checkpoint(
-                    checkpoint_dir / "best_ema.pt",
-                    model,
+                    checkpoint_dir / f"step_{step:06d}.pt",
+                    unwrap_model(model),
                     optimizer,
                     ema,
                     step,
                     cfg,
                     best_metric=best_metric,
                     best_metrics=best_metrics,
-                    training_state={
-                        "early_stop_best_score": early_stop_best_score,
-                        "early_stop_bad_validations": early_stop_bad_validations,
-                    },
+                    training_state=build_training_state(
+                        early_stop_best_score,
+                        early_stop_bad_validations,
+                        train_epoch,
+                        batches_seen_in_epoch,
+                        len(train_loader),
+                        recent_losses,
+                    ),
+                )
+                save_checkpoint(
+                    checkpoint_dir / "last.pt",
+                    unwrap_model(model),
+                    optimizer,
+                    ema,
+                    step,
+                    cfg,
+                    best_metric=best_metric,
+                    best_metrics=best_metrics,
+                    training_state=build_training_state(
+                        early_stop_best_score,
+                        early_stop_bad_validations,
+                        train_epoch,
+                        batches_seen_in_epoch,
+                        len(train_loader),
+                        recent_losses,
+                    ),
                 )
 
-            if early_stop_enabled:
-                current_score = compute_early_stop_score(val_metrics, early_stop_cfg)
-                val_metrics["early_stop_score"] = current_score
-                if current_score > early_stop_best_score + early_stop_min_delta:
-                    early_stop_best_score = current_score
-                    early_stop_bad_validations = 0
-                else:
-                    early_stop_bad_validations += 1
-                print(
-                    {
-                        "early_stop_score": current_score,
-                        "early_stop_best_score": early_stop_best_score,
-                        "early_stop_bad_validations": early_stop_bad_validations,
-                        "early_stop_patience": early_stop_patience,
-                    }
-                )
-                if run is not None:
-                    run.log(
-                        {
-                            "step": step,
-                            "early_stop_score": current_score,
-                            "early_stop_best_score": early_stop_best_score,
-                            "early_stop_bad_validations": early_stop_bad_validations,
-                        }
-                    )
+            if should_stop:
+                break
 
-            preview_batch = next(iter(val_loader))
-            preview_condition = preview_batch["condition"].to(device)
-            preview_side_labels = get_batch_side_labels(preview_batch, device)
-            preview_pred = run_sampler(eval_model, preview_condition, cfg["validation"]["sampler"], side_labels=preview_side_labels)
-            preview_name = str(preview_batch["name"][0])
-            save_tensor_npy(preview_pred[0], sample_dir / f"step_{step:06d}_{preview_name}_pred.npy")
-            for channel_idx in range(preview_pred.shape[1]):
-                save_tensor_png(preview_pred[0, channel_idx : channel_idx + 1], sample_dir / f"step_{step:06d}_{preview_name}_ch{channel_idx}.png")
-
-        if step % save_every == 0 or step == max_steps:
-            save_checkpoint(
-                checkpoint_dir / f"step_{step:06d}.pt",
-                model,
-                optimizer,
-                ema,
-                step,
-                cfg,
-                best_metric=best_metric,
-                best_metrics=best_metrics,
-                training_state={
-                    "early_stop_best_score": early_stop_best_score,
-                    "early_stop_bad_validations": early_stop_bad_validations,
-                },
-            )
-            save_checkpoint(
-                checkpoint_dir / "last.pt",
-                model,
-                optimizer,
-                ema,
-                step,
-                cfg,
-                best_metric=best_metric,
-                best_metrics=best_metrics,
-                training_state={
-                    "early_stop_best_score": early_stop_best_score,
-                    "early_stop_bad_validations": early_stop_bad_validations,
-                },
-            )
-
-        if early_stop_enabled and early_stop_bad_validations >= early_stop_patience:
-            print(
-                {
-                    "early_stop_triggered": True,
-                    "step": step,
-                    "early_stop_best_score": early_stop_best_score,
-                    "early_stop_bad_validations": early_stop_bad_validations,
-                }
-            )
-            break
-
-    if run is not None:
-        run.finish()
+        if run is not None:
+            run.finish()
+    finally:
+        cleanup_distributed(dist_ctx["distributed"])
 
 
 if __name__ == "__main__":

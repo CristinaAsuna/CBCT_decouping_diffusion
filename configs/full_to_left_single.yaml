@@ -4,7 +4,7 @@ device: null
 dataset:
   train:
     type: "case_folders"
-    case_root: "D:/nnunet/2D"
+    case_root: "/public_bme2/bme-cuizhm/maxquan/Datasets/CBCT/2D"
     split: "train"
     split_seed: 1234
     train_ratio: 0.9
@@ -23,7 +23,7 @@ dataset:
     clip_range: [0.0, 6.0]
   val:
     type: "case_folders"
-    case_root: "D:/nnunet/2D"
+    case_root: "/public_bme2/bme-cuizhm/maxquan/Datasets/CBCT/2D"
     split: "val"
     split_seed: 1234
     train_ratio: 0.9
@@ -102,4 +102,4 @@ logging:
   resume: null
 
 output:
-  root: "D:/vscode_workplace/codeplace/palette/outputs/full_to_left_single"
+  root: "/public_bme2/bme-cuizhm/maxquan/Projects/Replicate/Genai/palette/condition_injection/CBCT_decouping_diffusion/output"

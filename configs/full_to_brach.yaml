@@ -4,7 +4,7 @@ device: null
 dataset:
   train:
     type: "case_folders"
-    case_root: "D:/nnunet/2D_test_v2"
+    case_root: "/public_bme2/bme-cuizhm/maxquan/Datasets/CBCT/2D"
     split: "train"
     split_seed: 1234
     train_ratio: 0.9
@@ -13,14 +13,14 @@ dataset:
     target_templates:
       - "{variant}_left.npy"
       - "{variant}_right.npy"
-    target_mode: "multi_channel"
+    target_mode: "dual"
     image_size: [256, 256]
     normalize: "fixed_range_m11"
     value_range: [0.0, 6.0]
     clip_range: [0.0, 6.0]
   val:
     type: "case_folders"
-    case_root: "D:/nnunet/2D_test_v2"
+    case_root: "/public_bme2/bme-cuizhm/maxquan/Datasets/CBCT/2D"
     split: "val"
     split_seed: 1234
     train_ratio: 0.9
@@ -29,7 +29,7 @@ dataset:
     target_templates:
       - "{variant}_left.npy"
       - "{variant}_right.npy"
-    target_mode: "multi_channel"
+    target_mode: "dual"
     image_size: [256, 256]
     normalize: "fixed_range_m11"
     value_range: [0.0, 6.0]
@@ -38,10 +38,13 @@ dataset:
 model:
   image_size: 256
   inner_channel: 64
-  channel_mults: [1, 2, 4]
-  attn_res: []
-  res_blocks: 1
+  channel_mults: [1, 2, 4,8]
+  attn_res: [16]
+  res_blocks: 2
   dropout: 0.2
+  branch_decoder:
+    enabled: true
+    shared_blocks: 8
 
 diffusion:
   beta_schedule:
@@ -49,13 +52,23 @@ diffusion:
     n_timestep: 1000
     linear_start: 0.0001
     linear_end: 0.02
+  branch_loss_weights:
+    left: 1.0
+    right: 1.0
 
 train:
-  max_steps: 30000
-  batch_size: 4
-  val_batch_size: 4
+  max_steps: 450000
+  batch_size: 16
+  val_batch_size: 16
   num_workers: 0
-  lr: 0.00005
+  lr: 0.00008
+  lr_schedule:
+    enabled: true
+    type: "cosine_with_warmup"
+    warmup_steps: 10000
+    warmup_start_lr: 0.0
+    min_lr: 0.00002
+
   weight_decay: 0.0
   resume_checkpoint: null
   ema_decay: 0.9999
@@ -66,7 +79,7 @@ train:
   best_metric: "val_mae"
 
 validation:
-  max_batches: 10
+  max_batches: 32
   fid_every_steps: 0
   sampler:
     sampler: "ddim"
@@ -76,11 +89,11 @@ validation:
 logging:
   use_swanlab: true
   project: "palette_decoupling_cbct"
-  experiment_name: "cbct_1175_full_to_lr_multichannel"
+  experiment_name: "cbct_1175_full_to_lr_branch"
   mode: null
   logdir: null
   run_id: null
   resume: null
 
 output:
-  root: "D:/vscode_workplace/codeplace/palette/outputs/cbct_1175_full_to_lr_multichannel"
+  root: "/public_bme2/bme-cuizhm/maxquan/Projects/Replicate/Genai/palette/condition_injection/CBCT_decouping_diffusion/output/branch"
