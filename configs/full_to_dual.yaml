@@ -61,15 +61,15 @@ train:
   num_workers: 0
   lr: 0.00005
   lr_schedule:
-  enabled: true
-  type: "step"
-  steps:
-    - step: 300000
-      lr: 0.00004
-    - step: 350000
-      lr: 0.00003
-    - step: 400000
-      lr: 0.00002
+    enabled: true
+    type: "step"
+    steps:
+      - step: 300000
+        lr: 0.00004
+      - step: 350000
+        lr: 0.00003
+      - step: 400000
+        lr: 0.00002
 
   weight_decay: 0.0
   resume_checkpoint: null
