@@ -815,6 +815,8 @@ def main() -> None:
                         recent_losses,
                     ),
                 )
+            if dist_ctx["distributed"] and (step % save_every == 0 or step == max_steps):
+                dist.barrier()
 
             if should_stop:
                 break
