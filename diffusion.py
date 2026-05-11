@@ -84,9 +84,12 @@ class GaussianConditionalDiffusion(nn.Module):
         self.consistency_enabled = bool(consistency_cfg.get("enabled", False))
         if self.consistency_enabled and not self.denoise_fn.branch_decoder:
             raise ValueError("consistency_loss is currently only supported when branch_decoder is enabled")
-        self.consistency_lambda = float(consistency_cfg.get("lambda", 0.01))
+        self.consistency_lambda = float(consistency_cfg.get("lambda", 1e-4))
         self.consistency_gamma_power = float(consistency_cfg.get("gamma_power", 1.0))
         self.consistency_beta = float(consistency_cfg.get("smooth_l1_beta", 1.0))
+        self.consistency_eps = float(consistency_cfg.get("eps", 1e-6))
+        self.consistency_gamma_threshold = float(consistency_cfg.get("gamma_threshold", 0.8))
+        self.consistency_start_step = int(consistency_cfg.get("start_step", 0))
         self.normalize_mode = str(data_norm_cfg.get("normalize", "none"))
         self.value_range = data_norm_cfg.get("value_range")
         self.last_loss_breakdown: dict[str, float] = {}
@@ -98,16 +101,21 @@ class GaussianConditionalDiffusion(nn.Module):
             raise ValueError(f"Expected 2 channels for left/right split, got {tensor.shape[1]}")
         return tensor[:, 0:1], tensor[:, 1:2]
 
-    def _compute_training_loss(self, noise_hat: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
+    def _compute_training_loss(self, noise_hat: torch.Tensor, noise: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if not self.denoise_fn.branch_decoder:
-            return self.loss_fn(noise_hat, noise)
+            loss = self.loss_fn(noise_hat, noise)
+            return loss, {}
         pred_left, pred_right = self._split_left_right(noise_hat)
         noise_left, noise_right = self._split_left_right(noise)
         left_loss = self.loss_fn(pred_left, noise_left)
         right_loss = self.loss_fn(pred_right, noise_right)
         left_weight = self.branch_loss_weights["left"]
         right_weight = self.branch_loss_weights["right"]
-        return (left_weight * left_loss + right_weight * right_loss) / max(left_weight + right_weight, 1e-8)
+        total_loss = (left_weight * left_loss + right_weight * right_loss) / max(left_weight + right_weight, 1e-8)
+        return total_loss, {
+            "left_diff_loss": left_loss,
+            "right_diff_loss": right_loss,
+        }
 
     def _denormalize_to_raw(self, tensor: torch.Tensor) -> torch.Tensor:
         if self.normalize_mode == "none":
@@ -142,14 +150,19 @@ class GaussianConditionalDiffusion(nn.Module):
         full_raw = self._denormalize_to_raw(condition)
         left_raw = self._denormalize_to_raw(pred_left)
         right_raw = self._denormalize_to_raw(pred_right)
+        residual = (left_raw + right_raw - full_raw) / (full_raw + self.consistency_eps)
+        consistency_mask = (sample_gammas > self.consistency_gamma_threshold).to(dtype=full_raw.dtype).view(-1, 1, 1, 1)
         consistency_map = F.smooth_l1_loss(
-            left_raw + right_raw,
-            full_raw,
+            residual,
+            torch.zeros_like(residual),
             reduction="none",
             beta=self.consistency_beta,
         )
-        gamma_weight = sample_gammas.view(-1, 1, 1, 1).pow(self.consistency_gamma_power)
-        return (gamma_weight * consistency_map).mean()
+        gamma_weight = sample_gammas.view(-1, 1, 1, 1).pow(self.consistency_gamma_power) * consistency_mask
+        denom = gamma_weight.sum() * consistency_map.shape[1] * consistency_map.shape[2] * consistency_map.shape[3]
+        if float(denom.detach().item()) <= 0.0:
+            return torch.zeros((), device=condition.device, dtype=condition.dtype)
+        return (gamma_weight * consistency_map).sum() / denom
 
     def _set_noise_schedule(self) -> None:
         device = next(self.denoise_fn.parameters()).device
@@ -265,7 +278,13 @@ class GaussianConditionalDiffusion(nn.Module):
             "timesteps": timesteps,
         }
 
-    def forward(self, target: torch.Tensor, condition: torch.Tensor, side_labels: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        target: torch.Tensor,
+        condition: torch.Tensor,
+        side_labels: torch.Tensor | None = None,
+        global_step: int | None = None,
+    ) -> torch.Tensor:
         batch, *_ = target.shape
         t = torch.randint(1, self.num_timesteps, (batch,), device=target.device).long()
         gamma_t1 = extract(self.gammas, t - 1, x_shape=(1, 1))
@@ -274,9 +293,10 @@ class GaussianConditionalDiffusion(nn.Module):
         noise = torch.randn_like(target)
         y_noisy = self.q_sample(target, sample_gammas.view(-1, 1, 1, 1), noise)
         noise_hat = self.denoise_fn(torch.cat([condition, y_noisy], dim=1), sample_gammas.view(-1), side=side_labels)
-        diff_loss = self._compute_training_loss(noise_hat, noise)
+        diff_loss, diff_breakdown = self._compute_training_loss(noise_hat, noise)
         consistency_loss = torch.zeros((), device=target.device, dtype=diff_loss.dtype)
-        if self.consistency_enabled:
+        consistency_active = self.consistency_enabled and (global_step is None or global_step >= self.consistency_start_step)
+        if consistency_active:
             consistency_loss = self._compute_consistency_loss(condition, y_noisy, t, sample_gammas, noise_hat)
         consistency_term = self.consistency_lambda * consistency_loss
         total_loss = diff_loss + consistency_term
@@ -284,9 +304,12 @@ class GaussianConditionalDiffusion(nn.Module):
         consistency_term_value = float(consistency_term.detach().item())
         self.last_loss_breakdown = {
             "diff_loss": diff_loss_value,
+            "left_diff_loss": float(diff_breakdown["left_diff_loss"].detach().item()) if "left_diff_loss" in diff_breakdown else diff_loss_value,
+            "right_diff_loss": float(diff_breakdown["right_diff_loss"].detach().item()) if "right_diff_loss" in diff_breakdown else diff_loss_value,
             "consistency_loss": float(consistency_loss.detach().item()),
             "consistency_term": consistency_term_value,
             "consistency_ratio": consistency_term_value / max(diff_loss_value, 1e-8),
+            "consistency_active": 1.0 if consistency_active else 0.0,
             "total_loss": float(total_loss.detach().item()),
         }
         return total_loss

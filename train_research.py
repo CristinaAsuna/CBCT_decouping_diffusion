@@ -335,13 +335,22 @@ def get_batch_side_labels(batch: dict, device: torch.device) -> torch.Tensor | N
 
 
 @torch.no_grad()
-def validate(model, loader, device, sample_cfg: dict, max_batches: int | None = None, compute_fid: bool = False) -> dict[str, float]:
+def validate(
+    model,
+    loader,
+    device,
+    sample_cfg: dict,
+    max_batches: int | None = None,
+    compute_fid: bool = False,
+    global_step: int | None = None,
+) -> dict[str, float]:
     model.eval()
     losses: list[float] = []
     maes: list[float] = []
     mses: list[float] = []
     psnrs: list[float] = []
     ssims: list[float] = []
+    breakdown_values: dict[str, list[float]] = {}
     fid_preds = []
     fid_targets = []
     progress_total = min(len(loader), max_batches) if max_batches is not None else len(loader)
@@ -351,13 +360,16 @@ def validate(model, loader, device, sample_cfg: dict, max_batches: int | None = 
         condition = batch["condition"].to(device)
         target = batch["target"].to(device)
         side_labels = get_batch_side_labels(batch, device)
-        loss = model(target, condition, side_labels=side_labels)
+        loss = model(target, condition, side_labels=side_labels, global_step=global_step)
+        loss_breakdown = dict(getattr(model, "last_loss_breakdown", {}))
         pred = run_sampler(model, condition, sample_cfg, side_labels=side_labels)
         losses.append(float(loss.item()))
         maes.append(mae(pred, target))
         mses.append(mse(pred, target))
         psnrs.append(psnr(pred, target))
         ssims.append(ssim(pred, target))
+        for key, value in loss_breakdown.items():
+            breakdown_values.setdefault(key, []).append(float(value))
         if compute_fid:
             fid_preds.append(pred.detach().cpu())
             fid_targets.append(target.detach().cpu())
@@ -369,6 +381,9 @@ def validate(model, loader, device, sample_cfg: dict, max_batches: int | None = 
         "val_psnr": sum(psnrs) / max(len(psnrs), 1),
         "val_ssim": sum(ssims) / max(len(ssims), 1),
     }
+    for key in ("diff_loss", "left_diff_loss", "right_diff_loss", "consistency_loss", "consistency_term", "consistency_ratio", "consistency_active", "total_loss"):
+        if key in breakdown_values and breakdown_values[key]:
+            metrics[f"val_{key}"] = sum(breakdown_values[key]) / len(breakdown_values[key])
     if compute_fid and fid_preds:
         pred_tensor = torch.cat(fid_preds, dim=0)
         target_tensor = torch.cat(fid_targets, dim=0)
@@ -615,7 +630,7 @@ def main() -> None:
             target = batch["target"].to(device)
             side_labels = get_batch_side_labels(batch, device)
             optimizer.zero_grad(set_to_none=True)
-            loss = model(target, condition, side_labels=side_labels)
+            loss = model(target, condition, side_labels=side_labels, global_step=step)
             loss.backward()
             optimizer.step()
             if step >= ema_start:
@@ -628,6 +643,9 @@ def main() -> None:
                 recent_losses.pop(0)
             if is_main:
                 postfix = {"loss": f"{loss_value:.6f}", "avg": f"{sum(recent_losses)/len(recent_losses):.6f}"}
+                if "left_diff_loss" in loss_breakdown and "right_diff_loss" in loss_breakdown:
+                    postfix["left"] = f"{loss_breakdown['left_diff_loss']:.6f}"
+                    postfix["right"] = f"{loss_breakdown['right_diff_loss']:.6f}"
                 if "consistency_ratio" in loss_breakdown:
                     postfix["cons"] = f"{loss_breakdown.get('consistency_term', 0.0):.6f}"
                     postfix["cons_r"] = f"{loss_breakdown['consistency_ratio']:.3f}"
@@ -635,7 +653,7 @@ def main() -> None:
 
             if run is not None and step % log_every == 0:
                 train_log = {"step": step, "train_loss": sum(recent_losses) / len(recent_losses), "lr": get_optimizer_lr(optimizer)}
-                for key in ("diff_loss", "consistency_loss", "consistency_term", "consistency_ratio", "total_loss"):
+                for key in ("diff_loss", "left_diff_loss", "right_diff_loss", "consistency_loss", "consistency_term", "consistency_ratio", "consistency_active", "total_loss"):
                     if key in loss_breakdown:
                         train_log[key] = loss_breakdown[key]
                 run.log(train_log)
@@ -653,6 +671,7 @@ def main() -> None:
                         sample_cfg=cfg["validation"]["sampler"],
                         max_batches=cfg["validation"].get("max_batches"),
                         compute_fid=(fid_every > 0 and step % fid_every == 0),
+                        global_step=step,
                     )
                     val_metrics["lr"] = get_optimizer_lr(optimizer)
                     val_metrics["step"] = step
