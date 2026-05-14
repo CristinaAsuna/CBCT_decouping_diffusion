@@ -6,6 +6,7 @@ import copy
 import math
 import os
 import random
+from pathlib import Path
 
 import numpy as np
 
@@ -174,6 +175,80 @@ def maybe_init_swanlab(cfg: dict):
     return swanlab.init(**settings)
 
 
+def maybe_init_tensorboard(cfg: dict, output_dir: Path):
+    if not cfg.get("use_tensorboard", False):
+        return None
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except ImportError:
+        print("tensorboard is not installed, training will continue without TensorBoard logging.")
+        return None
+
+    logdir = os.environ.get("TENSORBOARD_LOGDIR", cfg.get("tensorboard_logdir"))
+    if logdir:
+        logdir = ensure_dir(logdir)
+    else:
+        logdir = ensure_dir(output_dir / "tensorboard")
+
+    print({"tensorboard_logdir": str(logdir)})
+    return SummaryWriter(log_dir=str(logdir))
+
+
+def log_monitoring_run(run, payload: dict, context: str):
+    if run is None:
+        return None
+    try:
+        run.log(payload)
+        return run
+    except Exception as exc:
+        print({"warning": f"swanlab logging disabled after {context} failure", "error": repr(exc)})
+        return None
+
+
+def tensorboard_add_scalars(writer, namespace: str, values: dict, step: int, skip_keys: tuple[str, ...] = ("step",)):
+    if writer is None:
+        return
+    for key, value in values.items():
+        if key in skip_keys:
+            continue
+        if isinstance(value, bool):
+            writer.add_scalar(f"{namespace}/{key}", int(value), step)
+        elif isinstance(value, (int, float)):
+            writer.add_scalar(f"{namespace}/{key}", value, step)
+
+
+def tensorboard_prepare_image(tensor: torch.Tensor) -> torch.Tensor:
+    image = tensor.detach().float().cpu().clamp(-1.0, 1.0)
+    image = (image + 1.0) / 2.0
+    return image
+
+
+def tensorboard_add_preview_images(
+    writer,
+    step: int,
+    condition: torch.Tensor,
+    target: torch.Tensor | None,
+    prediction: torch.Tensor,
+    name: str,
+):
+    if writer is None:
+        return
+    writer.add_image(f"preview/{name}/condition", tensorboard_prepare_image(condition), step)
+    if target is not None:
+        for channel_idx in range(target.shape[0]):
+            writer.add_image(
+                f"preview/{name}/target_ch{channel_idx}",
+                tensorboard_prepare_image(target[channel_idx : channel_idx + 1]),
+                step,
+            )
+    for channel_idx in range(prediction.shape[0]):
+        writer.add_image(
+            f"preview/{name}/pred_ch{channel_idx}",
+            tensorboard_prepare_image(prediction[channel_idx : channel_idx + 1]),
+            step,
+        )
+
+
 def capture_rng_state() -> dict:
     return {
         "python": random.getstate(),
@@ -198,6 +273,58 @@ def restore_rng_state(rng_state: dict | None) -> None:
         torch.set_rng_state(torch_state)
     if cuda_state is not None and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(cuda_state)
+
+
+def capture_rng_state_by_rank(dist_ctx: dict) -> dict[str, dict]:
+    local_state = capture_rng_state()
+    if not dist_ctx["distributed"]:
+        return {"0": local_state}
+
+    gathered_states = [None for _ in range(dist_ctx["world_size"])]
+    dist.all_gather_object(gathered_states, local_state)
+    return {str(rank): state for rank, state in enumerate(gathered_states) if state is not None}
+
+
+def restore_rng_state_for_rank(training_state: dict | None, dist_ctx: dict, is_main: bool) -> bool:
+    if not training_state:
+        return False
+
+    rng_state_by_rank = training_state.get("rng_state_by_rank")
+    if rng_state_by_rank is not None:
+        saved_world_size = int(training_state.get("rng_world_size", len(rng_state_by_rank)))
+        if saved_world_size != dist_ctx["world_size"]:
+            if is_main:
+                print(
+                    {
+                        "warning": "Skipping RNG restore because world size changed.",
+                        "saved_world_size": saved_world_size,
+                        "current_world_size": dist_ctx["world_size"],
+                    }
+                )
+            return False
+
+        rank_rng_state = rng_state_by_rank.get(str(dist_ctx["rank"]))
+        if rank_rng_state is None:
+            if is_main:
+                print(
+                    {
+                        "warning": "Skipping RNG restore because this rank has no saved RNG state.",
+                        "rank": dist_ctx["rank"],
+                    }
+                )
+            return False
+
+        restore_rng_state(rank_rng_state)
+        return True
+
+    legacy_rng_state = training_state.get("rng_state")
+    if legacy_rng_state is not None and not dist_ctx["distributed"]:
+        restore_rng_state(legacy_rng_state)
+        return True
+
+    if legacy_rng_state is not None and dist_ctx["distributed"] and is_main:
+        print({"warning": "Skipping legacy single-state RNG restore for DDP checkpoint."})
+    return False
 
 
 def normalize_training_progress(train_epoch: int, batches_seen_in_epoch: int, batches_per_epoch: int) -> tuple[int, int]:
@@ -227,16 +354,22 @@ def build_training_state(
     batches_seen_in_epoch: int,
     batches_per_epoch: int,
     recent_losses: list[float],
+    dist_ctx: dict,
 ) -> dict:
     normalized_epoch, normalized_batches = normalize_training_progress(train_epoch, batches_seen_in_epoch, batches_per_epoch)
-    return {
+    rng_state_by_rank = capture_rng_state_by_rank(dist_ctx)
+    training_state = {
         "early_stop_best_score": early_stop_best_score,
         "early_stop_bad_validations": early_stop_bad_validations,
         "train_epoch": normalized_epoch,
         "batches_seen_in_epoch": normalized_batches,
         "recent_losses": list(recent_losses),
-        "rng_state": capture_rng_state(),
+        "rng_state_by_rank": rng_state_by_rank,
+        "rng_world_size": dist_ctx["world_size"],
     }
+    if not dist_ctx["distributed"]:
+        training_state["rng_state"] = rng_state_by_rank.get("0")
+    return training_state
 
 
 class EMA:
@@ -547,6 +680,7 @@ def main() -> None:
     if dist_ctx["distributed"]:
         model = DDP(model, device_ids=[dist_ctx["local_rank"]] if device.type == "cuda" else None, output_device=dist_ctx["local_rank"] if device.type == "cuda" else None)
     run = maybe_init_swanlab(cfg.get("logging", {})) if is_main else None
+    tb_writer = maybe_init_tensorboard(cfg.get("logging", {}), output_dir) if is_main else None
 
     max_steps = int(cfg["train"]["max_steps"])
     validate_every = int(cfg["train"]["validate_every_steps"])
@@ -570,6 +704,7 @@ def main() -> None:
     recent_losses: list[float] = []
     train_epoch = 0
     batches_seen_in_epoch = 0
+    training_state: dict = {}
 
     resume_path = args.resume or cfg["train"].get("resume_checkpoint")
     if resume_path:
@@ -581,7 +716,6 @@ def main() -> None:
         batches_seen_in_epoch = int(training_state.get("batches_seen_in_epoch", batches_seen_in_epoch))
         saved_recent_losses = training_state.get("recent_losses", recent_losses)
         recent_losses = [float(item) for item in saved_recent_losses][-log_every:]
-        #restore_rng_state(training_state.get("rng_state"))
         if is_main:
             print(
                 {
@@ -610,6 +744,11 @@ def main() -> None:
     )
     train_epoch, batches_seen_in_epoch = normalize_training_progress(train_epoch, batches_seen_in_epoch, len(train_loader))
     train_iter = restore_train_iterator(train_loader, train_sampler, train_epoch, batches_seen_in_epoch)
+    rng_restored = restore_rng_state_for_rank(training_state, dist_ctx, is_main) if resume_path else False
+    if is_main and resume_path:
+        print({"rng_restored": rng_restored})
+    if dist_ctx["distributed"]:
+        dist.barrier()
 
     try:
         for step in progress:
@@ -656,12 +795,22 @@ def main() -> None:
                 for key in ("diff_loss", "left_diff_loss", "right_diff_loss", "consistency_loss", "consistency_term", "consistency_ratio", "consistency_active", "total_loss"):
                     if key in loss_breakdown:
                         train_log[key] = loss_breakdown[key]
-                run.log(train_log)
+                run = log_monitoring_run(run, train_log, "train_log")
+                tensorboard_add_scalars(tb_writer, "train", train_log, step)
 
             should_stop = False
             if step % validate_every == 0 or step == max_steps:
                 if dist_ctx["distributed"]:
                     dist.barrier()
+                validation_training_state = build_training_state(
+                    early_stop_best_score,
+                    early_stop_bad_validations,
+                    train_epoch,
+                    batches_seen_in_epoch,
+                    len(train_loader),
+                    recent_losses,
+                    dist_ctx,
+                )
                 if is_main:
                     eval_model = ema.ema_model
                     val_metrics = validate(
@@ -677,7 +826,8 @@ def main() -> None:
                     val_metrics["step"] = step
                     print(val_metrics)
                     if run is not None:
-                        run.log(val_metrics)
+                        run = log_monitoring_run(run, val_metrics, "val_metrics")
+                    tensorboard_add_scalars(tb_writer, "val", val_metrics, step)
 
                     current_mae = float(val_metrics["val_mae"])
                     if current_mae < best_metrics["val_mae"]:
@@ -691,14 +841,7 @@ def main() -> None:
                             cfg,
                             best_metric=current_mae,
                             best_metrics=best_metrics,
-                            training_state=build_training_state(
-                                early_stop_best_score,
-                                early_stop_bad_validations,
-                                train_epoch,
-                                batches_seen_in_epoch,
-                                len(train_loader),
-                                recent_losses,
-                            ),
+                            training_state=validation_training_state,
                         )
 
                     current_ssim = float(val_metrics["val_ssim"])
@@ -713,14 +856,7 @@ def main() -> None:
                             cfg,
                             best_metric=current_ssim,
                             best_metrics=best_metrics,
-                            training_state=build_training_state(
-                                early_stop_best_score,
-                                early_stop_bad_validations,
-                                train_epoch,
-                                batches_seen_in_epoch,
-                                len(train_loader),
-                                recent_losses,
-                            ),
+                            training_state=validation_training_state,
                         )
 
                     metric_value = float(val_metrics.get(best_metric_name, val_metrics["val_mae"]))
@@ -735,14 +871,7 @@ def main() -> None:
                             cfg,
                             best_metric=best_metric,
                             best_metrics=best_metrics,
-                            training_state=build_training_state(
-                                early_stop_best_score,
-                                early_stop_bad_validations,
-                                train_epoch,
-                                batches_seen_in_epoch,
-                                len(train_loader),
-                                recent_losses,
-                            ),
+                            training_state=validation_training_state,
                         )
 
                     if early_stop_enabled:
@@ -762,23 +891,44 @@ def main() -> None:
                             }
                         )
                         if run is not None:
-                            run.log(
+                            run = log_monitoring_run(
+                                run,
                                 {
                                     "step": step,
                                     "early_stop_score": current_score,
                                     "early_stop_best_score": early_stop_best_score,
                                     "early_stop_bad_validations": early_stop_bad_validations,
-                                }
+                                },
+                                "early_stop",
                             )
+                        tensorboard_add_scalars(
+                            tb_writer,
+                            "early_stop",
+                            {
+                                "early_stop_score": current_score,
+                                "early_stop_best_score": early_stop_best_score,
+                                "early_stop_bad_validations": early_stop_bad_validations,
+                            },
+                            step,
+                        )
 
                     preview_batch = next(iter(val_loader))
                     preview_condition = preview_batch["condition"].to(device)
+                    preview_target = preview_batch["target"]
                     preview_side_labels = get_batch_side_labels(preview_batch, device)
                     preview_pred = run_sampler(eval_model, preview_condition, cfg["validation"]["sampler"], side_labels=preview_side_labels)
                     preview_name = str(preview_batch["name"][0])
                     save_tensor_npy(preview_pred[0], sample_dir / f"step_{step:06d}_{preview_name}_pred.npy")
                     for channel_idx in range(preview_pred.shape[1]):
                         save_tensor_png(preview_pred[0, channel_idx : channel_idx + 1], sample_dir / f"step_{step:06d}_{preview_name}_ch{channel_idx}.png")
+                    tensorboard_add_preview_images(
+                        tb_writer,
+                        step,
+                        preview_condition[0],
+                        preview_target[0] if preview_target is not None else None,
+                        preview_pred[0],
+                        preview_name,
+                    )
 
                     if early_stop_enabled and early_stop_bad_validations >= early_stop_patience:
                         print(
@@ -797,6 +947,17 @@ def main() -> None:
                     should_stop = bool(stop_tensor.item())
                     dist.barrier()
 
+            periodic_training_state = None
+            if step % save_every == 0 or step == max_steps:
+                periodic_training_state = build_training_state(
+                    early_stop_best_score,
+                    early_stop_bad_validations,
+                    train_epoch,
+                    batches_seen_in_epoch,
+                    len(train_loader),
+                    recent_losses,
+                    dist_ctx,
+                )
             if is_main and (step % save_every == 0 or step == max_steps):
                 save_checkpoint(
                     checkpoint_dir / f"step_{step:06d}.pt",
@@ -807,14 +968,7 @@ def main() -> None:
                     cfg,
                     best_metric=best_metric,
                     best_metrics=best_metrics,
-                    training_state=build_training_state(
-                        early_stop_best_score,
-                        early_stop_bad_validations,
-                        train_epoch,
-                        batches_seen_in_epoch,
-                        len(train_loader),
-                        recent_losses,
-                    ),
+                    training_state=periodic_training_state,
                 )
                 save_checkpoint(
                     checkpoint_dir / "last.pt",
@@ -825,14 +979,7 @@ def main() -> None:
                     cfg,
                     best_metric=best_metric,
                     best_metrics=best_metrics,
-                    training_state=build_training_state(
-                        early_stop_best_score,
-                        early_stop_bad_validations,
-                        train_epoch,
-                        batches_seen_in_epoch,
-                        len(train_loader),
-                        recent_losses,
-                    ),
+                    training_state=periodic_training_state,
                 )
             if dist_ctx["distributed"] and (step % save_every == 0 or step == max_steps):
                 dist.barrier()
@@ -843,6 +990,8 @@ def main() -> None:
         if run is not None:
             run.finish()
     finally:
+        if tb_writer is not None:
+            tb_writer.close()
         cleanup_distributed(dist_ctx["distributed"])
 
 

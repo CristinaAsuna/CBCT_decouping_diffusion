@@ -93,10 +93,12 @@ validation:
 
 logging:
   use_swanlab: true
+  use_tensorboard: true
   project: "palette_decoupling_cbct"
   experiment_name: "cbct_1175_full_to_lr_branch_consistency_finetune"
   mode: null
   logdir: null
+  tensorboard_logdir: null
   run_id: null
   resume: null
 

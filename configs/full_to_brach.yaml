@@ -58,10 +58,7 @@ diffusion:
     left: 1.0
     right: 1.0
   consistency_loss:
-    enabled: true
-    lambda: 0.01
-    gamma_power: 1.0
-    smooth_l1_beta: 1.0
+    enabled: false
 
 train:
   max_steps: 450000
@@ -81,7 +78,7 @@ train:
   ema_decay: 0.9999
   ema_start_step: 100
   validate_every_steps: 1000
-  save_every_steps: 5000
+  save_every_steps: 10000
   log_every_steps: 50
   best_metric: "val_mae"
 
@@ -95,13 +92,15 @@ validation:
 
 logging:
   use_swanlab: true
+  use_tensorboard: true
   project: "palette_decoupling_cbct"
-  experiment_name: "cbct_1175_full_to_lr_branch"
+  experiment_name: "cbct_1175_full_to_lr_branch_baseline"
   mode: null
   logdir: null
+  tensorboard_logdir: null
   run_id: null
   resume: null
 
 output:
   #root: "/public_bme2/bme-cuizhm/maxquan/Projects/Replicate/Genai/palette/condition_injection/CBCT_decouping_diffusion/output/branch"
-  root : "D:/vscode_workplace/codeplace/palette/outputs/branch"
+  root : "D:/vscode_workplace/codeplace/palette/outputs/branch_baseline"
