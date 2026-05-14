@@ -9,4 +9,5 @@ swanlog/
 swanlog_branch/
 swanlog_dual/
 swanlog_single_right/
+*swanlog*/
 logs/
