@@ -1,0 +1,4 @@
+Exp ID,实验标题,对应 Idea,Baseline,唯一主改动,固定条件,数据预算,训练预算,起始 checkpoint,主指标,成功判据,停止判据,状态,优先级,关联 Runs,结论摘要
+E-001,纯 branch baseline 训练到收敛,I-005,branch + concat + dual-output,无主改动仅作为稳定 baseline,固定 split/seed/sampler/eval,全量数据,训练到 400k~450k,from scratch,val_mae val_psnr val_ssim left_diff_loss right_diff_loss,得到稳定可复现 baseline 并能观察左右分支差异,出现明显训练异常或工程问题,Running,P0,,"先把 baseline 训稳"
+E-002,打印并比较 left_diff_loss 与 right_diff_loss,I-005,E-001 baseline,增加左右分支 loss 记录,模型结构不变,全量数据,随 baseline 同步进行,继承 E-001,left_diff_loss right_diff_loss val_left_diff_loss val_right_diff_loss,定位左右亮度不一致是否伴随损失长期失衡,如果损失无明显差异则转向数据或归一化分析,Running,P0,,"判断亮度问题来源"
+E-003,consistency 仅用于后期微调,I-004,E-001 baseline,在成熟 branch checkpoint 上加入低噪声相对残差 consistency loss,固定 backbone 与数据,全量数据,额外 20k~40k step,step_400000 或 best_ema,val_mae val_psnr val_ssim physics_mae,physics 指标改善且主任务指标基本不掉,亮度变差或 psnr 明显下降则停止,Planned,P1,,"只在 baseline 收敛后再做"

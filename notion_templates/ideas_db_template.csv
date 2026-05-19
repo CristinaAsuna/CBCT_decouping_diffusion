@@ -1,0 +1,6 @@
+Idea ID,标题,模块,动机,假设,预期收益,实现成本,训练成本,是否可warm-start,优先级,状态,关联实验,备注
+I-001,concat 改为 condition encoder,Condition Injection,希望比直接 concat 更好地利用条件图像信息,条件特征多尺度注入可能提升生成质量与解耦能力,高,中,高,是,P1,Ready,,建议先做成增量模块而不是直接替换
+I-002,在 encoder/decoder 增加 attention,Attention,怀疑当前注意力分布不足以建模更长程依赖,中高分辨率额外注意力可能改善结构细节与全局一致性,中,中,高,否,P2,Inbox,,先做小规模筛选
+I-003,用 window attention 替换 MHA,Attention,降低全局注意力开销并提升局部建模效率,窗口注意力可能在本任务上以更低成本获得相近或更好效果,中,高,高,否,P3,Inbox,,优先级低于 cond encoder
+I-004,late consistency finetune,Loss,在 baseline 学稳后再加物理一致性约束,后期微调比从头加入 consistency 更稳,中,低,中,是,P0,Testing,,只在低噪声阶段启用
+I-005,分析 left/right 亮度不一致,Eval,当前 branch 推理时左右亮度存在不一致,打印左右分支损失能帮助定位偏差来源,高,低,低,是,P0,Testing,,先确认问题来自 baseline 还是 consistency

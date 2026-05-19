@@ -1,0 +1,4 @@
+Decision ID,主题,基于哪些实验,结论,证据,下一步动作,置信度,是否已纳入 baseline
+D-001,consistency 不适合从头训练,E-003,从头加入 consistency 容易损害亮度与 PSNR,已有从头训练结果显示图像变灰且主指标退化,改成 late finetune,高,否
+D-002,branch baseline 需要长程训练才能收敛,E-001,branch 通常需要 400k~450k 才能稳定,现有训练经验显示 256k 左右仍处于明显波动阶段,先完整训练 baseline 再做其他判断,高,是
+D-003,需要单独跟踪左右分支损失,E-002,left/right 亮度不一致需要结合左右 loss 判断来源,导师建议打印左右 loss 且当前工程已支持记录,以此作为 baseline 诊断固定项,高,是

@@ -1,0 +1,98 @@
+seed: 1234
+device: null
+
+dataset:
+  train:
+    type: "case_folders"
+    case_root: "D:/nnunet/2d_projection_physics_consistent"
+    case_names_file: "tiny_ablation/case_splits/tiny_cases.txt"
+    split: null
+    split_seed: 1234
+    train_ratio: 0.9
+    variants: ["std", "aug"]
+    condition_template: "{variant}_full.npy"
+    target_templates: ["{variant}_left.npy", "{variant}_right.npy"]
+    target_mode: "dual"
+    image_size: [128, 128]
+    normalize: "fixed_range_m11"
+    value_range: [0.0, 6.0]
+    clip_range: [0.0, 6.0]
+  val:
+    type: "case_folders"
+    case_root: "D:/nnunet/2d_projection_physics_consistent"
+    case_names_file: "tiny_ablation/case_splits/tiny_cases.txt"
+    split: null
+    split_seed: 1234
+    train_ratio: 0.9
+    variants: ["std", "aug"]
+    condition_template: "{variant}_full.npy"
+    target_templates: ["{variant}_left.npy", "{variant}_right.npy"]
+    target_mode: "dual"
+    image_size: [128, 128]
+    normalize: "fixed_range_m11"
+    value_range: [0.0, 6.0]
+    clip_range: [0.0, 6.0]
+
+model:
+  image_size: 128
+  inner_channel: 32
+  channel_mults: [1, 2, 4, 8]
+  attn_res: [16]
+  res_blocks: 1
+  dropout: 0.0
+  branch_decoder:
+    enabled: true
+    shared_blocks: 6
+
+tiny_branch:
+  condition_encoder:
+    enabled: false
+  attention:
+    type: "vanilla"
+
+diffusion:
+  beta_schedule:
+    schedule: "linear"
+    n_timestep: 1000
+    linear_start: 0.0001
+    linear_end: 0.02
+  branch_loss_weights:
+    left: 1.0
+    right: 1.0
+  consistency_loss:
+    enabled: false
+
+train:
+  max_steps: 50000
+  finetune_steps: 20000
+  batch_size: 4
+  val_batch_size: 4
+  num_workers: 0
+  lr: 0.00001
+  lr_schedule:
+    enabled: false
+  weight_decay: 0.0
+  resume_checkpoint: "{output_root}/tiny_branch_01_baseline/checkpoints/best.pt"
+  strict_resume: true
+  resume_optimizer: false
+  inherit_best_metric: false
+  validate_every_steps: 500
+  save_every_steps: 10000
+  log_every_steps: 20
+  best_metric: "val_mae"
+
+validation:
+  max_batches: 4
+  sampler:
+    sampler: "ddim"
+    steps: 20
+    eta: 0.0
+
+logging:
+  use_swanlab: false
+  use_tensorboard: true
+  experiment_name: "tiny_branch_07_baseline_finetune_control"
+  tensorboard_logdir: null
+
+output:
+  root: "tiny_ablation/outputs/tiny_branch_07_baseline_finetune_control"

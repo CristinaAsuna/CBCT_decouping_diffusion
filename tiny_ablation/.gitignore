@@ -1,0 +1,6 @@
+outputs/
+generated_configs/
+generated_branch_configs/
+npy_visualization*/
+case_splits/*.txt
+!case_splits/.gitkeep

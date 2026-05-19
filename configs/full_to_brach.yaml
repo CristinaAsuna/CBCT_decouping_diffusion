@@ -5,7 +5,7 @@ dataset:
   train:
     type: "case_folders"
     #case_root: "/public_bme2/bme-cuizhm/maxquan/Datasets/CBCT/2D"
-    case_root: "D:/nnunet/2D"
+    case_root: "D:/nnunet/2d_projection_physics_consistent"
     split: "train"
     split_seed: 1234
     train_ratio: 0.9
@@ -21,8 +21,8 @@ dataset:
     clip_range: [0.0, 6.0]
   val:
     type: "case_folders"
-    #case_root: "/public_bme2/bme-cuizhm/maxquan/Datasets/CBCT/2D"
-    case_root: "D:/nnunet/2D"
+    #ase_root: "/public_bme2/bme-cuizhm/maxquan/Datasets/CBCT/2D"
+    case_root: "D:/nnunet/2d_projection_physics_consistent"
     split: "val"
     split_seed: 1234
     train_ratio: 0.9
@@ -85,6 +85,7 @@ train:
 validation:
   max_batches: 32
   fid_every_steps: 0
+  physics_visual_limit: 1
   sampler:
     sampler: "ddim"
     steps: 50
@@ -103,4 +104,4 @@ logging:
 
 output:
   #root: "/public_bme2/bme-cuizhm/maxquan/Projects/Replicate/Genai/palette/condition_injection/CBCT_decouping_diffusion/output/branch"
-  root : "D:/vscode_workplace/codeplace/palette/outputs/branch_baseline"
+  root : "D:/vscode_workplace/codeplace/palette/CBCT_decouping_diffusion/output/results/branch_consistent"

@@ -1,0 +1,4 @@
+Run ID,Run 名称,对应实验,Git Commit,配置文件,Resume Checkpoint,机器/GPU,数据子集,训练步数,Seed,输出目录,Best val_mae,Best val_psnr,Best val_ssim,Physics MAE,Left diff loss,Right diff loss,是否有亮度异常,视觉判断,状态,一句话结论
+R-001,branch baseline full run,E-001,,configs/full_to_brach.yaml,,A100 x2,full,450000,1234,output/branch_baseline,,,,,,,否,待训练完成后填写,Running,这是当前主 baseline
+R-002,left-right loss tracking,E-002,,configs/full_to_brach.yaml,,A100 x2,full,450000,1234,output/branch_baseline,,,,,,,是,重点观察左右亮度和左右分支损失,Running,用于定位亮度不一致原因
+R-003,late consistency finetune from mature branch,E-003,,configs/full_to_brach_consistency_finetune.yaml,step_400000.pt,A100 x2,full,30000,1234,output/branch_consistency_finetune,,,,,,,否,重点观察 physics 改善但不能牺牲亮度,Queued,先等 branch baseline 收敛

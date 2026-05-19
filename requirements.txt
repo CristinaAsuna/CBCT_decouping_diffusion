@@ -6,3 +6,4 @@ PyYAML
 tqdm
 swanlab
 clean-fid
+matplotlib
