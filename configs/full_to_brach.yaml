@@ -4,7 +4,7 @@ device: null
 dataset:
   train:
     type: "case_folders"
-    case_root: "/public_bme2/bme-cuizhm/maxquan/Datasets/CBCT/2D"
+    case_root: "/public_bme2/bme-cuizhm/maxquan/Datasets/CBCT/2d_projection_physics_consistent"
     # case_root: "D:/nnunet/2D"
     split: "train"
     split_seed: 1234
@@ -21,7 +21,7 @@ dataset:
     clip_range: [0.0, 6.0]
   val:
     type: "case_folders"
-    case_root: "/public_bme2/bme-cuizhm/maxquan/Datasets/CBCT/2D"
+    case_root: "/public_bme2/bme-cuizhm/maxquan/Datasets/CBCT/2d_projection_physics_consistent"
     # case_root: "D:/nnunet/2D"
     split: "val"
     split_seed: 1234
@@ -59,6 +59,11 @@ diffusion:
     right: 1.0
   consistency_loss:
     enabled: false
+    # lambda: 0.0001
+    # max_ratio: 0.1
+    # gamma_power: 1.0
+    # gamma_threshold: 0.8
+    # smooth_l1_beta: 1.0
 
 train:
   max_steps: 450000
@@ -85,6 +90,7 @@ train:
 validation:
   max_batches: 32
   fid_every_steps: 0
+  physics_visual_limit: 1
   sampler:
     sampler: "ddim"
     steps: 50
@@ -102,5 +108,5 @@ logging:
   resume: null
 
 output:
-  root: "/public_bme2/bme-cuizhm/maxquan/Projects/Replicate/Genai/palette/consistent/CBCT_decouping_diffusion/output/branch_baseline_tensorboad"
+  root: "/public_bme2/bme-cuizhm/maxquan/Projects/Replicate/Genai/palette/consistent/CBCT_decouping_diffusion/output/branch_base_finall"
   #root : "D:/vscode_workplace/codeplace/palette/outputs/branch_baseline"

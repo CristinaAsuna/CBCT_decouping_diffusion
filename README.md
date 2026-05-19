@@ -1,25 +1,44 @@
-# CBCT Decoupling Diffusion 使用说明
+# CBCT Decoupling Diffusion 使用说明（新版）
 
-这是一份新的项目说明文档，不会覆盖现有的 `README.md`。
 
-当前项目已经支持以下几类任务：
+## 1. 项目当前支持的主要模型
 
-- `full -> left` 单边生成
-- `full -> [left, right]` 双通道联合生成
-- `full -> side-conditioned single output`，通过 `side_emb` 控制输出 `left/right`
+当前项目主要支持以下几类任务：
 
-同时支持：
+1. 单边生成
+   - `full -> left`
+   - `full -> right`
+2. 双输出生成
+   - `full -> [left, right]`
+3. side embedding 注入
+   - 单模型，根据 `side label` 生成 `left` 或 `right`
+4. branch decoder
+   - 共享前半解码器，左右两支分支分别输出
 
-- DDPM / DDIM 推理
-- EMA 权重
-- `best_ema.pt`、`best_ema_mae.pt`、`best_ema_ssim.pt`
-- `step` 学习率调度
-- `cosine_with_warmup` 学习率调度
-- 基于 `MAE + SSIM` 的 early stopping
+5. Physical consistency loss
+   - 训练时使用+loss,推理时显示计算residaul=full-left_pre-right_pre
+   - left_crr=left_pre+0.5*res
+   - 当然,设定tolerate_mae=0.15,if mae>tolearate, do crr
 
-## 1. 目录结构
+对应配置文件如下：
 
-推荐的数据目录形式如下：
+- `configs/full_to_left_single.yaml`
+  - 单边生成，输出 `left`
+- `configs/full_to_right_single.yaml`
+  - 单边生成，输出 `right`
+- `configs/full_to_dual.yaml`
+  - 直接双通道输出 `[left, right]`
+- `configs/full_to_sidecond.yaml`
+  - side-conditioned 模型
+- `configs/full_to_brach.yaml`
+  - branch decoder 模型
+  - 注意：文件名当前是 `brach`，不是 `branch`
+
+---
+
+## 2. 推荐的数据组织方式
+
+推荐的 case-folder 结构如下：
 
 ```text
 D:/nnunet/2D/
@@ -39,184 +58,236 @@ D:/nnunet/2D/
 - `*_full.npy` 是条件输入
 - `*_left.npy` 是左侧目标
 - `*_right.npy` 是右侧目标
-- `std` / `aug` 是两个变体
+- `std` / `aug` 是不同变体
 
-## 2. 配置文件
+---
 
-项目中已经提供了三份可直接使用的配置：
+## 3. 环境依赖
 
-- [configs/full_to_left_single.yaml](/D:/vscode_workplace/codeplace/palette/visual/CBCT_decouping_diffusion/configs/full_to_left_single.yaml)
-- [configs/full_to_dual.yaml](/D:/vscode_workplace/codeplace/palette/visual/CBCT_decouping_diffusion/configs/full_to_dual.yaml)
-- [configs/full_to_sidecond.yaml](/D:/vscode_workplace/codeplace/palette/visual/CBCT_decouping_diffusion/configs/full_to_sidecond.yaml)
+`requirements.txt` 中列出的核心依赖包括：
 
-它们分别对应：
+- `torch`
+- `torchvision`
+- `numpy`
+- `Pillow`
+- `PyYAML`
+- `tqdm`
+- `swanlab`
+- `clean-fid`
 
-- `full_to_left_single.yaml`
-  训练 `full -> left`
-- `full_to_dual.yaml`
-  训练 `full -> [left, right]`
-- `full_to_sidecond.yaml`
-  训练 side-conditioned 模型，单模型可生成 `left` 或 `right`
 
-如果在服务器上训练，请先把下面这些路径改成服务器路径：
 
-- `dataset.train.case_root`
-- `dataset.val.case_root`
-- `output.root`
+---
 
-## 3. 训练
+## 4. 启动方式
 
-### 3.1 full -> left
+当前代码支持两种启动方式：
+
+1. 包方式启动
 
 ```powershell
 python -m CBCT_decouping_diffusion.train_research --config CBCT_decouping_diffusion/configs/full_to_left_single.yaml
 ```
 
-### 3.2 full -> [left, right]
+2. 直接脚本启动
 
 ```powershell
-python -m CBCT_decouping_diffusion.train_research --config CBCT_decouping_diffusion/configs/full_to_dual.yaml
+python train_research.py --config configs/full_to_left_single.yaml
 ```
 
-### 3.3 full -> side-conditioned
+推理和评估脚本同样支持这两种方式。
+
+如果你在项目根目录 `CBCT_decouping_diffusion` 下工作，通常直接脚本方式最方便。
+
+---
+
+## 5. 训练
+
+### 5.1 `full -> left`
 
 ```powershell
-python -m CBCT_decouping_diffusion.train_research --config CBCT_decouping_diffusion/configs/full_to_sidecond.yaml
+python train_research.py --config configs/full_to_left_single.yaml
 ```
 
-### 3.4 断点续训
+### 5.2 `full -> right`
 
 ```powershell
-python -m CBCT_decouping_diffusion.train_research `
-  --config CBCT_decouping_diffusion/configs/full_to_left_single.yaml `
-  --resume /path/to/checkpoints/last.pt
+python train_research.py --config configs/full_to_right_single.yaml
 ```
 
-## 4. 训练模式说明
+### 5.3 `full -> [left, right]`
 
-### 4.1 single
+```powershell
+python train_research.py --config configs/full_to_dual.yaml
+```
 
-配置关键项：
+### 5.4 side-conditioned
+
+```powershell
+python train_research.py --config configs/full_to_sidecond.yaml
+```
+
+### 5.5 branch decoder
+
+```powershell
+python train_research.py --config configs/full_to_brach.yaml
+```
+
+---
+
+## 6. DDP 训练
+
+当前训练脚本已经支持 DDP，推荐通过 `torchrun` 启动。
+
+### 6.1 单机双卡示例
+
+```powershell
+torchrun --standalone --nproc_per_node=2 train_research.py --config configs/full_to_left_single.yaml
+```
+
+### 6.2 单机四卡示例
+
+```powershell
+torchrun --standalone --nproc_per_node=4 train_research.py --config configs/full_to_dual.yaml
+```
+
+### 6.3 说明
+
+- `torchrun` 会自动注入 `WORLD_SIZE`、`RANK`、`LOCAL_RANK`
+- 当前代码内部会根据这些环境变量自动初始化 DDP
+- 主进程负责打印日志、验证、保存 checkpoint
+- 非主进程不重复做这些工作
+
+建议：
+
+- 单卡训练可直接 `python train_research.py ...`
+- 多卡训练尽量统一使用 `torchrun`
+
+---
+
+## 7. 训练输出目录
+
+训练输出根目录由配置文件中的：
 
 ```yaml
-target_mode: "single"
-target_side: "left"
-target_template: "{variant}_{side}.npy"
+output:
+  root: "/path/to/output"
 ```
 
-含义：
+控制。
 
-- 每个样本只取一个目标
-- 如果 `target_side: left`，训练的是 `full -> left`
-- 如果改成 `right`，训练的是 `full -> right`
+通常会生成以下内容：
 
-### 4.2 dual
+### 7.1 checkpoints
 
-配置关键项：
-
-```yaml
-target_mode: "dual"
-target_sides: ["left", "right"]
-target_template: "{variant}_{side}.npy"
-```
-
-含义：
-
-- 一个样本同时加载 `left` 和 `right`
-- 输出固定为双通道
-- `ch0 = left`
-- `ch1 = right`
-
-### 4.3 side_cond
-
-配置关键项：
-
-```yaml
-target_mode: "side_cond"
-target_sides: ["left", "right"]
-side_labels:
-  left: 0
-  right: 1
-```
-
-含义：
-
-- 训练时把 `left/right` 作为 side label
-- 模型内部使用 `side_emb + time_emb`
-- 仍然是单输出通道，但推理时可以通过 side 控制生成左侧或右侧
-
-## 5. 学习率与 Early Stop
-
-项目支持两类学习率调度：
-
-- `step`
-- `cosine_with_warmup`
-
-例如：
-
-```yaml
-lr_schedule:
-  enabled: true
-  type: "cosine_with_warmup"
-  warmup_steps: 10000
-  warmup_start_lr: 0.0
-  min_lr: 0.000001
-```
-
-当前 early stopping 使用综合分数：
+位于：
 
 ```text
-score = ssim_weight * val_ssim - mae_weight * val_mae
+output_root/checkpoints/
 ```
 
-例如：
+包含：
 
-```yaml
-early_stop:
-  enabled: true
-  patience_validations: 20
-  min_delta: 0.0002
-  score:
-    mae_weight: 1.0
-    ssim_weight: 1.0
+- `best_ema.pt`
+  - 按 `train.best_metric` 保存的主 best
+- `best_ema_mae.pt`
+  - `val_mae` 最优
+- `best_ema_ssim.pt`
+  - `val_ssim` 最优
+- `last.pt`
+  - 最近一次保存的训练状态
+- `step_xxxxxx.pt`
+  - 周期性保存的训练状态
+
+### 7.2 samples
+
+位于：
+
+```text
+output_root/samples/
 ```
 
-## 6. 保存的权重
+通常会保存验证预览图与预览 `.npy`。
 
-训练过程中会保存：
+---
 
-- `checkpoints/best_ema.pt`
-  按 `train.best_metric` 保存的主 best
-- `checkpoints/best_ema_mae.pt`
-  `val_mae` 最优
-- `checkpoints/best_ema_ssim.pt`
-  `val_ssim` 最优
-- `checkpoints/last.pt`
-  最近一次保存的 checkpoint
-- `checkpoints/step_xxxxxx.pt`
-  周期保存
+## 8. 推理
 
-## 7. 推理
+推理脚本：
 
-### 7.1 单边模型推理
+```powershell
+python infer_research.py --config ... --checkpoint ... --output-dir ...
+```
+
+推荐推理时优先使用：
+
+- `best_ema.pt`
+- `best_ema_mae.pt`
+- `best_ema_ssim.pt`
+
+通常不建议推理时优先用 `last.pt`，除非你就是想看最近一步的效果。
+
+## Infer,Val
+
+Infer,去掉limit,则为全量
+
+```powershell
+python infer_research.py `
+  --config configs/full_to_brach.yaml `
+  --checkpoint D:\vscode_workplace\codeplace\palette\CBCT_decouping_diffusion\output\checkpoints\branch_consistent\best_ema.pt `
+  --split val `
+  --case-root D:\nnunet\2d_projection_physics_consistent `
+  --output-dir D:\vscode_workplace\codeplace\palette\CBCT_decouping_diffusion\output\results\branch_consistent_corr_check `
+  --weights ema `
+  --limit 20 `
+  --branch-correction equal `
+  --branch-correction-strength 1
+
+
+```
+
+Val
+```powershell
+python evaluate_research.py `
+  --config configs/full_to_brach.yaml `
+  --pred-dir D:\vscode_workplace\codeplace\palette\CBCT_decouping_diffusion\output\results\branch_consistent_corr_check `
+  --split val `
+  --case-root D:\nnunet\2d_projection_physics_consistent
+
+```
+
+### 8.1 单边模型推理
 
 ```powershell
 python infer_research.py `
   --config configs/full_to_left_single.yaml `
-  --checkpoint output/checkpoints/best_ema_mae.pt `
+  --checkpoint output/checkpoints/best_ema.pt `
   --split val `
   --case-root D:/nnunet/2D `
   --case-name Bone_0001 `
   --variant std `
-  --output-dir output/infer/Bone_0001_std
+  --output-dir output/infer_left/Bone_0001_std
 ```
 
-### 7.2 双通道模型推理
+### 8.2 `full -> right` 推理
+
+```powershell
+python infer_research.py `
+  --config configs/full_to_right_single.yaml `
+  --checkpoint output/checkpoints/best_ema.pt `
+  --split val `
+  --case-root D:/nnunet/2D `
+  --case-name Bone_0001 `
+  --variant std `
+  --output-dir output/infer_right/Bone_0001_std
+```
+
+### 8.3 双通道模型推理
 
 ```powershell
 python infer_research.py `
   --config configs/full_to_dual.yaml `
-  --checkpoint output/checkpoints/best_ema_ssim.pt `
+  --checkpoint output/checkpoints/best_ema.pt `
   --split val `
   --case-root D:/nnunet/2D `
   --case-name Bone_0001 `
@@ -224,19 +295,19 @@ python infer_research.py `
   --output-dir output/infer_dual/Bone_0001_std
 ```
 
-输出结果中：
+输出中：
 
-- `*_ch0.png` 对应 left
-- `*_ch1.png` 对应 right
+- `*_ch0.png` 对应 `left`
+- `*_ch1.png` 对应 `right`
 
-### 7.3 side-conditioned 模型推理
+### 8.4 side-conditioned 推理
 
 生成 `left`：
 
 ```powershell
 python infer_research.py `
   --config configs/full_to_sidecond.yaml `
-  --checkpoint output/checkpoints/best_ema_ssim.pt `
+  --checkpoint output/checkpoints/best_ema.pt `
   --split val `
   --case-root D:/nnunet/2D `
   --case-name Bone_0001 `
@@ -250,7 +321,7 @@ python infer_research.py `
 ```powershell
 python infer_research.py `
   --config configs/full_to_sidecond.yaml `
-  --checkpoint output/checkpoints/best_ema_ssim.pt `
+  --checkpoint output/checkpoints/best_ema.pt `
   --split val `
   --case-root D:/nnunet/2D `
   --case-name Bone_0001 `
@@ -259,123 +330,213 @@ python infer_research.py `
   --output-dir output/infer_side_right/Bone_0001_std
 ```
 
-## 8. DDIM 采样过程可视化
+说明：
 
-如果想导出采样过程：
+- side-conditioned 数据集内部每个样本是按 `left/right` 分开组织的
+- 当你只想推单个 case 时，建议显式传 `--side left` 或 `--side right`
+
+### 8.5 branch decoder 推理
 
 ```powershell
 python infer_research.py `
-  --config configs/full_to_left_single.yaml `
-  --checkpoint output/checkpoints/best_ema_ssim.pt `
+  --config configs/full_to_brach.yaml `
+  --checkpoint output/checkpoints/best_ema.pt `
   --split val `
   --case-root D:/nnunet/2D `
   --case-name Bone_0001 `
-  --variant aug `
-  --output-dir output/trace/Bone_0001_aug `
-  --save-trace `
-  --trace-channel 0
+  --variant std `
+  --output-dir output/infer_branch/Bone_0001_std
 ```
 
-会生成：
+branch decoder 的输出同样是双通道：
 
-- `*_sampling.gif`
-  DDIM 当前采样状态演化
-- `*_predx0.gif`
-  每一步预测的 `x0_hat`
-- `*_sampling_grid.png`
-- `*_predx0_grid.png`
-- `*_trace/`
-  每一步单独 PNG
+- `ch0 = left`
+- `ch1 = right`
 
-## 9. 评估
+### 8.6 批量推理整个 split
 
-评估流程分两步：
+如果不传 `--case-name`，脚本会遍历整个 split：
 
-### 9.1 先批量推理
+```powershell
+python infer_research.py `
+  --config configs/full_to_dual.yaml `
+  --checkpoint output/checkpoints/best_ema.pt `
+  --split val `
+  --output-dir output/infer_dual_val
+```
+
+### 8.7 保存 DDIM 中间轨迹
 
 ```powershell
 python infer_research.py `
   --config configs/full_to_left_single.yaml `
-  --checkpoint output/checkpoints/best_ema_mae.pt `
+  --checkpoint output/checkpoints/best_ema.pt `
   --split val `
   --case-root D:/nnunet/2D `
-  --output-dir output/eval_preds/val_left
+  --case-name Bone_0001 `
+  --variant std `
+  --save-trace `
+  --trace-channel 0 `
+  --output-dir output/infer_trace/Bone_0001_std
 ```
 
-### 9.2 再计算指标
+---
+
+## 9. `val` 评估
+
+评估脚本：
+
+```powershell
+python evaluate_research.py --config ... --pred-dir ...
+```
+
+### 9.1 单边模型评估
 
 ```powershell
 python evaluate_research.py `
   --config configs/full_to_left_single.yaml `
+  --pred-dir output/infer_left_val `
   --split val `
-  --case-root D:/nnunet/2D `
-  --pred-dir output/eval_preds/val_left
+  --case-root D:/nnunet/2D
 ```
 
-如需 FID：
+### 9.2 双通道模型评估
 
 ```powershell
 python evaluate_research.py `
-  --config configs/full_to_left_single.yaml `
+  --config configs/full_to_dual.yaml `
+  --pred-dir output/infer_dual_val `
+  --split val `
+  --case-root D:/nnunet/2D
+```
+
+### 9.3 side-conditioned 模型评估
+
+如果你保存的是 side-conditioned 在 `val` split 上的整批输出，也可以直接评估：
+
+```powershell
+python evaluate_research.py `
+  --config configs/full_to_sidecond.yaml `
+  --pred-dir output/infer_side_val `
+  --split val `
+  --case-root D:/nnunet/2D
+```
+
+### 9.4 计算 FID
+
+```powershell
+python evaluate_research.py `
+  --config configs/full_to_dual.yaml `
+  --pred-dir output/infer_dual_val `
   --split val `
   --case-root D:/nnunet/2D `
-  --pred-dir output/eval_preds/val_left `
   --with-fid
 ```
 
-当前支持：
+---
 
-- `MAE`
-- `MSE`
-- `PSNR`
-- `SSIM`
-- `FID`
 
-## 10. 评估时的注意事项
+## 14. 哪些 checkpoint 用于什么场景
 
-### 10.1 不要复用旧的 pred 目录
+### 14.1 继续训练
 
-每换一个 checkpoint，建议换一个新的 `pred-dir`，避免旧预测和新预测混在一起。
+优先使用：
 
-### 10.2 dual 模型的评估
+- `last.pt`
+- `step_xxxxxx.pt`
 
-`full_to_dual.yaml` 下，评估会把预测的双通道结果和 `[left, right]` 真值一起比较。
+理由：
 
-### 10.3 side_cond 模型的评估
+- 它们最适合表示“某个确定训练时刻的完整状态”
+- 尤其是 `last.pt` 最适合“中断后继续”
 
-`full_to_sidecond.yaml` 下，dataset 会展开成：
+### 14.2 推理
 
-- `Bone_xxxx__std__left`
-- `Bone_xxxx__std__right`
+优先使用：
 
-所以推理和评估时，预测文件名也必须和这个样本命名一致。
+- `best_ema.pt`
+- `best_ema_mae.pt`
+- `best_ema_ssim.pt`
 
-## 11. 运行方式
+理由：
 
-如果按包方式运行，建议在项目上一级目录执行：
+- 这些通常是验证结果最好的权重
 
-```powershell
-python -m CBCT_decouping_diffusion.train_research --config CBCT_decouping_diffusion/configs/full_to_left_single.yaml
-```
 
-如果直接在当前目录运行，也已经兼容：
+
+
+
+## 17. 常见建议
+
+### 17.1 单边任务
+
+适合先验证基础可训练性，最容易定位问题。
+
+### 17.2 双通道直接输出
+
+适合验证联合生成是否有效。
+
+### 17.3 side-conditioned
+
+优点：
+
+- 一个模型可以生成左右两边
+
+注意：
+
+- 推理单个 case 时要注意 `--side`
+
+### 17.4 branch decoder
+
+适合你想保留共享表征，但让左右输出分支各自学习的情况。
+
+---
+
+## 18. 一套典型工作流示例
+
+### 18.1 训练
 
 ```powershell
 python train_research.py --config configs/full_to_left_single.yaml
 ```
 
-推理和评估脚本也支持同样两种方式。
+### 18.2 中断后恢复
 
-## 12. 建议的使用顺序
+```powershell
+python train_research.py `
+  --config configs/full_to_left_single.yaml `
+  --resume output/checkpoints/last.pt
+```
 
-如果你想先做稳妥实验，建议顺序是：
+### 18.3 推理 `val`
 
-1. 先跑 `full_to_left_single.yaml`
-2. 再跑 `full_to_dual.yaml`
-3. 最后试 `full_to_sidecond.yaml`
+```powershell
+python infer_research.py `
+  --config configs/full_to_left_single.yaml `
+  --checkpoint output/checkpoints/best_ema.pt `
+  --split val `
+  --output-dir output/infer_left_val
+```
 
-原因是：
+### 18.4 评估 `val`
 
-- `single` 最稳定，最容易分析
-- `dual` 能直接看联合输出是否值得
-- `side_cond` 更灵活，但训练稳定性和可解释性更依赖实验结果
+```powershell
+python evaluate_research.py `
+  --config configs/full_to_left_single.yaml `
+  --pred-dir output/infer_left_val `
+  --split val
+```
+
+---
+
+## 19. 总结
+
+对于你现在这套代码，最推荐的使用原则是：
+
+1. 继续训练用 `last.pt` 或 `step_xxxxxx.pt`
+2. 推理优先用 `best_ema.pt`
+3. 恢复训练时学习率不会从头开始
+4. 正常恢复通常不会单独导致大幅振荡
+5. 真正容易引入振荡的是模型、损失、归一化、batch size、world size、数据流程的变化
+
+如果后续你还准备继续扩展实验，我建议把每一种方法单独再整理成一页“推荐配置 + 推荐命令 + 推荐 checkpoint 选择”的实验手册，这样后面复现实验会轻松很多。

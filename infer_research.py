@@ -12,12 +12,26 @@ try:
     from .config import ensure_dir, load_config
     from .dataset import CaseFolderNpyDataset, NpyConditionTargetDataset
     from .diffusion import GaussianConditionalDiffusion
+    from .physics import (
+        apply_branch_physics_correction,
+        compute_branch_physics_metrics,
+        safe_filename,
+        save_branch_comparison_visualization,
+        save_physics_visualization,
+    )
     from .utils import pick_device, save_tensor_gif, save_tensor_grid_png, save_tensor_npy, save_tensor_png
 except ImportError:
     from checkpointing import load_checkpoint_file, select_model_state
     from config import ensure_dir, load_config
     from dataset import CaseFolderNpyDataset, NpyConditionTargetDataset
     from diffusion import GaussianConditionalDiffusion
+    from physics import (
+        apply_branch_physics_correction,
+        compute_branch_physics_metrics,
+        safe_filename,
+        save_branch_comparison_visualization,
+        save_physics_visualization,
+    )
     from utils import pick_device, save_tensor_gif, save_tensor_grid_png, save_tensor_npy, save_tensor_png
 
 
@@ -188,6 +202,12 @@ def main() -> None:
     parser.add_argument("--trace-channel", type=int, default=0, help="Target channel index to visualize")
     parser.add_argument("--gif-duration-ms", type=int, default=120, help="Frame duration for exported GIF")
     parser.add_argument("--limit", type=int, default=None, help="Maximum number of samples to infer")
+    parser.add_argument("--no-physics-visuals", action="store_true", help="Disable branch physics visualization output")
+    parser.add_argument("--no-branch-quality-visuals", action="store_true", help="Disable GT-vs-pred branch quality visualization output")
+    parser.add_argument("--branch-correction", default="none", choices=["none", "equal", "proportional"], help="Apply inference-time full = left + right correction for branch models")
+    parser.add_argument("--branch-correction-strength", type=float, default=1.0, help="Correction strength; 1.0 makes the corrected sum match full exactly before optional visualization")
+    parser.add_argument("--branch-correction-min-residual-mae", type=float, default=None, help="Only correct samples whose physics_residual_mae is above this threshold")
+    parser.add_argument("--branch-correction-min-rel-mae", type=float, default=None, help="Only correct samples whose physics_residual_rel_mae_masked is above this threshold")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -208,9 +228,12 @@ def main() -> None:
     model_state, model_state_name = select_model_state(state, weights=args.weights)
     model.load_state_dict(model_state, strict=True)
     model.eval()
+    is_branch_model = bool(getattr(getattr(model, "denoise_fn", None), "branch_decoder", False))
     print({"loaded_weights": model_state_name, "checkpoint": str(args.checkpoint)})
 
     output_dir = ensure_dir(args.output_dir)
+    physics_dir = ensure_dir(output_dir / "physics")
+    branch_quality_dir = ensure_dir(output_dir / "branch_quality")
     sampler_cfg = cfg.get("validation", {}).get("sampler", {"sampler": "ddim", "steps": 50, "eta": 0.0})
     selected_sample = None
     if args.case_name is not None or args.sample_name is not None:
@@ -244,6 +267,65 @@ def main() -> None:
             else:
                 pred = run_sampler(model, condition, sampler_cfg, side_labels=side_labels)[0]
 
+            branch_metrics = None
+            raw_pred = pred.detach().clone()
+            correction_applied = False
+            if is_branch_model and pred.shape[0] >= 2:
+                target = sample.get("target")
+                target_tensor = target if isinstance(target, torch.Tensor) else None
+                branch_metrics = compute_branch_physics_metrics(
+                    sample["condition"],
+                    pred,
+                    target_tensor,
+                    data_norm_cfg=dataset_cfg,
+                )
+                should_correct = args.branch_correction != "none"
+                if should_correct and args.branch_correction_min_residual_mae is not None:
+                    should_correct = branch_metrics["physics_residual_mae"] > args.branch_correction_min_residual_mae
+                if should_correct and args.branch_correction_min_rel_mae is not None:
+                    should_correct = branch_metrics["physics_residual_rel_mae_masked"] > args.branch_correction_min_rel_mae
+                if args.branch_correction != "none" and not should_correct:
+                    print(
+                        {
+                            "sample": name,
+                            "branch_correction": args.branch_correction,
+                            "correction_applied": False,
+                            "physics_residual_mae": branch_metrics["physics_residual_mae"],
+                            "physics_residual_rel_mae_masked": branch_metrics["physics_residual_rel_mae_masked"],
+                        }
+                    )
+                if should_correct:
+                    corrected_pred = apply_branch_physics_correction(
+                        sample["condition"],
+                        pred,
+                        data_norm_cfg=dataset_cfg,
+                        mode=args.branch_correction,
+                        strength=args.branch_correction_strength,
+                    )
+                    corrected_metrics = compute_branch_physics_metrics(
+                        sample["condition"],
+                        corrected_pred,
+                        target_tensor,
+                        data_norm_cfg=dataset_cfg,
+                    )
+                    print(
+                        {
+                            "sample": name,
+                            "branch_correction": args.branch_correction,
+                            "branch_correction_strength": args.branch_correction_strength,
+                            "correction_applied": True,
+                            "before_physics_residual_mae": branch_metrics["physics_residual_mae"],
+                            "after_physics_residual_mae": corrected_metrics["physics_residual_mae"],
+                            "before_left_loss": branch_metrics.get("left_loss"),
+                            "after_left_loss": corrected_metrics.get("left_loss"),
+                            "before_right_loss": branch_metrics.get("right_loss"),
+                            "after_right_loss": corrected_metrics.get("right_loss"),
+                        }
+                    )
+                    pred = corrected_pred
+                    branch_metrics = corrected_metrics
+                    correction_applied = True
+
             save_tensor_npy(sample["condition"], output_dir / f"{name}_condition.npy")
             save_tensor_png(sample["condition"][0:1], output_dir / f"{name}_condition_ch0.png")
             if "target" in sample:
@@ -256,6 +338,72 @@ def main() -> None:
             save_tensor_npy(pred, output_dir / f"{name}.npy")
             for channel_idx in range(pred.shape[0]):
                 save_tensor_png(pred[channel_idx : channel_idx + 1], output_dir / f"{name}_ch{channel_idx}.png")
+            if branch_metrics is not None:
+                print(
+                    {
+                        "sample": name,
+                        "branch_correction": args.branch_correction,
+                        "branch_left_loss": branch_metrics.get("left_loss"),
+                        "branch_right_loss": branch_metrics.get("right_loss"),
+                        "branch_left_mae": branch_metrics.get("left_mae"),
+                        "branch_right_mae": branch_metrics.get("right_mae"),
+                        "physics_residual_mae": branch_metrics["physics_residual_mae"],
+                        "physics_residual_rmse": branch_metrics["physics_residual_rmse"],
+                        "physics_residual_rel_mae_masked": branch_metrics["physics_residual_rel_mae_masked"],
+                        "physics_corr_masked": branch_metrics["physics_corr_masked"],
+                    }
+                )
+                if not args.no_physics_visuals:
+                    title = (
+                        f"{name} | "
+                        f"L loss={branch_metrics.get('left_loss', 0.0):.6g}, "
+                        f"R loss={branch_metrics.get('right_loss', 0.0):.6g}, "
+                        f"res MAE={branch_metrics['physics_residual_mae']:.6g}"
+                    )
+                    save_physics_visualization(
+                        sample["condition"],
+                        pred,
+                        physics_dir / f"{safe_filename(name)}_physics.png",
+                        title=title,
+                        data_norm_cfg=dataset_cfg,
+                    )
+                target = sample.get("target")
+                if not args.no_branch_quality_visuals and isinstance(target, torch.Tensor) and target.shape[0] >= 2:
+                    branch_title = (
+                        f"{name} | "
+                        f"L MAE={branch_metrics.get('left_mae', 0.0):.6g}, "
+                        f"R MAE={branch_metrics.get('right_mae', 0.0):.6g}, "
+                        f"res MAE={branch_metrics['physics_residual_mae']:.6g}"
+                    )
+                    save_branch_comparison_visualization(
+                        sample["condition"],
+                        pred,
+                        target,
+                        branch_quality_dir / f"{safe_filename(name)}_branch_quality.png",
+                        title=branch_title,
+                        data_norm_cfg=dataset_cfg,
+                    )
+                    if correction_applied:
+                        raw_metrics = compute_branch_physics_metrics(
+                            sample["condition"],
+                            raw_pred,
+                            target,
+                            data_norm_cfg=dataset_cfg,
+                        )
+                        raw_title = (
+                            f"{name} | raw | "
+                            f"L MAE={raw_metrics.get('left_mae', 0.0):.6g}, "
+                            f"R MAE={raw_metrics.get('right_mae', 0.0):.6g}, "
+                            f"res MAE={raw_metrics['physics_residual_mae']:.6g}"
+                        )
+                        save_branch_comparison_visualization(
+                            sample["condition"],
+                            raw_pred,
+                            target,
+                            branch_quality_dir / f"{safe_filename(name)}_raw_branch_quality.png",
+                            title=raw_title,
+                            data_norm_cfg=dataset_cfg,
+                        )
 
 
 if __name__ == "__main__":

@@ -4,8 +4,8 @@ device: null
 dataset:
   train:
     type: "case_folders"
-    #case_root: "/public_bme2/bme-cuizhm/maxquan/Datasets/CBCT/2D"
-    case_root: "D:/nnunet/2D"
+    case_root: "/public_bme2/bme-cuizhm/maxquan/Datasets/CBCT/2d_projection_physics_consistent"
+    #case_root: "D:/nnunet/2D"
     split: "train"
     split_seed: 1234
     train_ratio: 0.9
@@ -21,8 +21,9 @@ dataset:
     clip_range: [0.0, 6.0]
   val:
     type: "case_folders"
-    #case_root: "/public_bme2/bme-cuizhm/maxquan/Datasets/CBCT/2D"
-    case_root: "D:/nnunet/2D"
+    case_root: "/public_bme2/bme-cuizhm/maxquan/Datasets/CBCT/2d_projection_physics_consistent"
+
+    #case_root: "D:/nnunet/2D"
     split: "val"
     split_seed: 1234
     train_ratio: 0.9
@@ -61,19 +62,24 @@ diffusion:
     enabled: true
     lambda: 0.0001
     gamma_power: 1.0
+    max_ratio: 0.1
     gamma_threshold: 0.8
     smooth_l1_beta: 1.0
     eps: 0.000001
     start_step: 150000
 
 train:
-  max_steps: 220000
-  batch_size: 16
+  max_steps: 450000
+  batch_size: 8
   val_batch_size: 16
   num_workers: 0
-  lr: 0.00001
+  lr: 0.00008
   lr_schedule:
-    enabled: false
+    enabled: true
+    type: "cosine_with_warmup"
+    warmup_steps: 10000
+    warmup_start_lr: 0.0
+    min_lr: 0.00002
   weight_decay: 0.0
   resume_checkpoint: null
   ema_decay: 0.9999
@@ -104,4 +110,4 @@ logging:
 
 output:
   #root: "/public_bme2/bme-cuizhm/maxquan/Projects/Replicate/Genai/palette/condition_injection/CBCT_decouping_diffusion/output/branch_consistency_finetune"
-  root: "D:/vscode_workplace/codeplace/palette/outputs/branch_consistency_finetune"
+  root: "/public_bme2/bme-cuizhm/maxquan/Projects/Replicate/Genai/palette/consistent/CBCT_decouping_diffusion/output/branch_base_finall"
